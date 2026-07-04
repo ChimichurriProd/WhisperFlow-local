@@ -1,16 +1,27 @@
 """Speech-to-text: faster-whisper (CTranslate2) with Silero VAD gating silence."""
 
 
+def build_initial_prompt(terms):
+    """Turn a vocabulary term list into a Whisper initial_prompt string.
+
+    Seeding the decoder with the terms biases it toward those exact spellings,
+    so names/jargon/brands transcribe correctly. Returns None when empty.
+    """
+    terms = [t.strip() for t in (terms or []) if t and t.strip()]
+    return ("Vocabulary: " + ", ".join(terms) + ".") if terms else None
+
+
 class Transcriber:
     """Wraps faster_whisper.WhisperModel; the model loads lazily on first use."""
 
     def __init__(self, model="tiny.en", device="cpu", compute_type="int8",
-                 language=None, vad_filter=True):
+                 language=None, vad_filter=True, initial_prompt=None):
         self.model_name = model
         self.device = device
         self.compute_type = compute_type
         self.language = language or None  # None/"" -> auto-detect per utterance
         self.vad_filter = vad_filter
+        self.initial_prompt = initial_prompt
         self._model = None
 
     def _ensure_model(self):
@@ -31,6 +42,7 @@ class Transcriber:
             audio,
             language=self.language,
             vad_filter=self.vad_filter,
+            initial_prompt=self.initial_prompt,
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         if self.language is None and text:

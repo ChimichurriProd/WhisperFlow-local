@@ -132,9 +132,25 @@ Set `injection.delivery_method` in `config.json`:
     "restore_clipboard": true,
     "type_char_delay_ms": 5
   },
-  "audio": { "sample_rate": 16000, "channels": 1 }
+  "audio": { "sample_rate": 16000, "channels": 1, "mic_gain": 4.5 },
+  "vocabulary": {
+    "terms": ["Ollama", "WhisperFlow"],  // bias Whisper toward these spellings
+    "fixes": { "olama": "Ollama" }        // force exact corrections (wrong->right)
+  }
 }
 ```
+
+### Custom vocabulary
+
+Teach WhisperFlow *your* words — names, jargon, brands, acronyms — so they
+transcribe correctly instead of being mangled:
+
+- **`terms`**: a list of words/phrases. These are fed to Whisper as context so
+  it *prefers* those spellings at the source. Add colleague/company names,
+  product names, technical terms you dictate often.
+- **`fixes`**: an exact `"wrong": "right"` map applied after transcription
+  (whole-word, case-insensitive). Use this for stubborn mishears — e.g.
+  `"olama": "Ollama"`. Fixes are the final say, overriding STT and the LLM.
 
 **Model size vs. latency:** `tiny.en`/`base` respond near-instantly and are the
 right default for dictation. On an Apple Silicon Mac with plenty of RAM you can

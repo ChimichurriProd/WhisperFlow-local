@@ -16,7 +16,7 @@ import time
 from .audio import Recorder
 from .cleanup import clean_transcript
 from .injection import inject_text
-from .stt import Transcriber
+from .stt import Transcriber, build_initial_prompt
 
 
 def parse_hotkey(spec):
@@ -94,7 +94,12 @@ class PushToTalkApp:
             channels=config["audio"]["channels"],
             mic_gain=config["audio"].get("mic_gain", 4.5),
         )
-        self.transcriber = Transcriber(**config["stt"])
+        self._initial_prompt = build_initial_prompt(
+            config.get("vocabulary", {}).get("terms", [])
+        )
+        self.transcriber = Transcriber(
+            **config["stt"], initial_prompt=self._initial_prompt
+        )
         self._busy = threading.Lock()
         self._pressed = set()  # currently-held keys, maintained by the listener
         self._on_status = on_status  # callable(state: str), e.g. menu-bar icon
@@ -106,7 +111,9 @@ class PushToTalkApp:
     def set_model(self, model_name):
         """Swap the STT model at runtime (loads lazily on next dictation)."""
         self.config["stt"]["model"] = model_name
-        self.transcriber = Transcriber(**self.config["stt"])
+        self.transcriber = Transcriber(
+            **self.config["stt"], initial_prompt=self._initial_prompt
+        )
 
     def _wait_hotkey_released(self, timeout=1.0):
         """Block until the user lets go of the hotkey keys (or timeout).

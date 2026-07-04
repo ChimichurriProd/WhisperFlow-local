@@ -30,6 +30,21 @@ CLEANUP_PROMPT = (
 )
 
 
+def apply_vocabulary_fixes(text, fixes):
+    """Force exact corrections (wrong -> right), whole-word, case-insensitive.
+
+    The last word on spelling: guarantees the user's preferred forms in the
+    output even if Whisper or the LLM produced a mishear.
+    """
+    if not text or not fixes:
+        return text
+    for wrong, right in fixes.items():
+        if not wrong:
+            continue
+        text = re.sub(rf"\b{re.escape(wrong)}\b", right, text, flags=re.IGNORECASE)
+    return text
+
+
 def strip_fillers(text):
     """Rule-based cleanup: drop fillers, collapse whitespace, capitalize, punctuate."""
     cleaned = _FILLER_RE.sub("", text)
@@ -74,16 +89,20 @@ def clean_transcript(text, config):
 
     if word_count < cfg["skip_llm_under_words"]:
         # Latency rule: short utterances skip the LLM entirely.
-        return strip_fillers(text)
+        result = strip_fillers(text)
+    else:
+        try:
+            result = ollama_clean(
+                text,
+                ollama_url=cfg["ollama_url"],
+                ollama_model=cfg["ollama_model"],
+                timeout=cfg["timeout_seconds"],
+                keep_alive=cfg.get("keep_alive", "30m"),
+            )
+        except (requests.RequestException, KeyError, ValueError):
+            # Ollama down/misconfigured: degrade to rules, never block.
+            result = strip_fillers(text)
 
-    try:
-        return ollama_clean(
-            text,
-            ollama_url=cfg["ollama_url"],
-            ollama_model=cfg["ollama_model"],
-            timeout=cfg["timeout_seconds"],
-            keep_alive=cfg.get("keep_alive", "30m"),
-        )
-    except (requests.RequestException, KeyError, ValueError):
-        # Ollama down/misconfigured: degrade to rule-based cleanup, never block.
-        return strip_fillers(text)
+    # Custom-vocabulary corrections win over whatever STT/LLM produced.
+    fixes = config.get("vocabulary", {}).get("fixes", {})
+    return apply_vocabulary_fixes(result, fixes)

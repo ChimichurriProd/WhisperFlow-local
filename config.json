@@ -26,5 +26,9 @@
     "sample_rate": 16000,
     "channels": 1,
     "mic_gain": 4.5
+  },
+  "vocabulary": {
+    "terms": ["Ollama", "WhisperFlow", "faster-whisper", "CTranslate2"],
+    "fixes": {}
   }
 }

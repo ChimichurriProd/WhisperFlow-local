@@ -57,6 +57,28 @@ def test_long_utterance_calls_ollama(config):
     assert result == "Polished."
 
 
+def test_vocabulary_fixes_applied(config):
+    config["vocabulary"] = {"terms": [], "fixes": {"olama": "Ollama"}}
+    text = "i use olama every day"  # 5 words -> skip LLM path
+    result = cleanup.clean_transcript(text, config)
+    assert "Ollama" in result
+    assert "olama" not in result.lower().replace("ollama", "")
+
+
+def test_vocabulary_fixes_whole_word_only():
+    # should not touch substrings inside other words
+    out = cleanup.apply_vocabulary_fixes("scala and cat", {"cat": "CAT"})
+    assert out == "scala and CAT"
+
+
+def test_build_initial_prompt():
+    from app.stt import build_initial_prompt
+
+    assert build_initial_prompt([]) is None
+    p = build_initial_prompt(["Ollama", "WhisperFlow"])
+    assert "Ollama" in p and "WhisperFlow" in p
+
+
 def test_ollama_failure_falls_back_to_rules(config):
     text = "um " + " ".join(["word"] * 11)
     with patch.object(

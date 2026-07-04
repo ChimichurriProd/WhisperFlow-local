@@ -33,6 +33,13 @@ DEFAULTS = {
         "channels": 1,
         "mic_gain": 4.5,  # waveform sensitivity; higher = more reactive
     },
+    "vocabulary": {
+        # 'terms' bias Whisper toward these spellings (names, jargon, brands).
+        "terms": ["Ollama", "WhisperFlow", "faster-whisper", "CTranslate2"],
+        # 'fixes' force exact corrections after transcription (wrong -> right),
+        # whole-word and case-insensitive, for stubborn mishears.
+        "fixes": {},
+    },
 }
 
 VALID_DELIVERY_METHODS = ("clipboard", "type")
