@@ -1,0 +1,30 @@
+{
+  "stt": {
+    "model": "small",
+    "device": "cpu",
+    "compute_type": "int8",
+    "language": null,
+    "vad_filter": true
+  },
+  "cleanup": {
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "llama3.1:8b",
+    "skip_llm_under_words": 10,
+    "timeout_seconds": 30,
+    "keep_alive": "30m"
+  },
+  "hotkey": {
+    "push_to_talk": "control + shift + space"
+  },
+  "injection": {
+    "delivery_method": "clipboard",
+    "restore_clipboard": true,
+    "type_char_delay_ms": 5,
+    "append_trailing_space": true
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "channels": 1,
+    "mic_gain": 4.5
+  }
+}
