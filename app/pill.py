@@ -203,12 +203,12 @@ try:
 
             if c.style == "marvin":
                 NSGraphicsContext.saveGraphicsState()
-                if abs(c.tilt) > 0.05:  # rotate the head around its centre
-                    t = NSAffineTransform.transform()
-                    t.translateXBy_yBy_(w / 2.0, h / 2.0)
-                    t.rotateByDegrees_(c.tilt)
-                    t.translateXBy_yBy_(-w / 2.0, -h / 2.0)
-                    t.concat()
+                t = NSAffineTransform.transform()
+                t.translateXBy_yBy_(0.0, c.nod)          # vertical nod (fake pitch)
+                t.translateXBy_yBy_(w / 2.0, h / 2.0)
+                t.rotateByDegrees_(c.tilt)               # head roll (listening)
+                t.translateXBy_yBy_(-w / 2.0, -h / 2.0)
+                t.concat()
                 self._draw_marvin(c, w, h)
                 NSGraphicsContext.restoreGraphicsState()
                 return
@@ -272,20 +272,27 @@ try:
 
         @objc.python_method
         def _eye_glow(self, w, h, glow):
-            """Additive green bloom over each eye, intensity = loudness."""
+            """Soft, feathered green bloom over BOTH eyes, intensity = loudness.
+
+            Three stacked radial gradients (core -> soft -> wide halo) so it
+            fades out gradually instead of looking like a hard disc.
+            """
+            core = min(0.6, glow * 0.8)
             for nx, ny in self._EYES:
                 gx, gy = nx * w, ny * h
-                rad = w * 0.15 * (1.0 + glow * 0.5)
-                grad = NSGradient.alloc().initWithColors_([
-                    _rgb(0.55, 1.0, 0.40, min(0.75, glow * 0.85)),
-                    _rgb(0.55, 1.0, 0.40, 0.0),
-                ])
-                path = NSBezierPath.bezierPathWithOvalInRect_(
-                    NSMakeRect(gx - rad, gy - rad, 2 * rad, 2 * rad)
-                )
-                grad.drawInBezierPath_relativeCenterPosition_(
-                    path, NSMakePoint(0.0, 0.0)
-                )
+                for scale, alpha in ((0.11, core), (0.20, core * 0.55),
+                                     (0.34, core * 0.28)):
+                    rad = w * scale * (1.0 + glow * 0.4)
+                    grad = NSGradient.alloc().initWithColors_([
+                        _rgb(0.55, 1.0, 0.42, alpha),
+                        _rgb(0.55, 1.0, 0.42, 0.0),
+                    ])
+                    path = NSBezierPath.bezierPathWithOvalInRect_(
+                        NSMakeRect(gx - rad, gy - rad, 2 * rad, 2 * rad)
+                    )
+                    grad.drawInBezierPath_relativeCenterPosition_(
+                        path, NSMakePoint(0.0, 0.0)
+                    )
 
         @objc.python_method
         def _draw_marvin_vector(self, c, w, h):
@@ -399,7 +406,8 @@ try:
             self.levels = [0.0] * _BARS
             self._phase = 0.0
             self._anim = 0.0
-            self.tilt = 0.0  # head-tilt degrees (marvin style)
+            self.tilt = 0.0  # head-roll degrees (marvin style)
+            self.nod = 0.0   # vertical nod offset in px (fake pitch)
             self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
             self._w = _MARVIN_SIZE if style == "marvin" else _WIDTH_IDLE
 
@@ -419,7 +427,9 @@ try:
             self.window.setOpaque_(False)
             self.window.setBackgroundColor_(NSColor.clearColor())
             self.window.setLevel_(NSStatusWindowLevel)
-            self.window.setHasShadow_(True)
+            # No window shadow for Marvin — it would render as a square around
+            # the circular head. The waveform pill keeps its shadow.
+            self.window.setHasShadow_(style != "marvin")
             self.window.setCollectionBehavior_(
                 NSWindowCollectionBehaviorCanJoinAllSpaces
                 | NSWindowCollectionBehaviorStationary
@@ -503,10 +513,13 @@ try:
             # dictating, a barely-there bob when idle. Eased for smoothness.
             self._anim += 0.05
             if mode in ("recording", "transcribing"):
-                target = 9.0 * math.sin(self._anim * 2.2)  # attentive sway
+                target = 9.0 * math.sin(self._anim * 2.2)          # attentive roll
+                nod_target = 2.6 * math.sin(self._anim * 3.1 + 1)  # gentle nod
             else:
-                target = 2.0 * math.sin(self._anim * 0.9)  # subtle idle life
+                target = 2.0 * math.sin(self._anim * 0.9)          # subtle idle
+                nod_target = 1.0 * math.sin(self._anim * 1.1)
             self.tilt += (target - self.tilt) * 0.25
+            self.nod += (nod_target - self.nod) * 0.25
             self._render()
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
