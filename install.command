@@ -22,7 +22,6 @@ die()  { echo "  ${RED}✗ $*${RESET}"; echo; echo "Installation stopped. Fix th
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/Library/WhisperFlow"          # TCC-safe runtime location
 APPDIR="$HOME/Applications"
-STT_MODEL="small"
 LLM_MODEL="llama3.1:8b"
 
 clear
@@ -63,6 +62,7 @@ if [[ -z "$PY" ]]; then
     PY="$(brew --prefix)/bin/python3.12"
 fi
 ok "using $($PY --version) at $PY"
+PYVER="$("$PY" -c 'import sys;print("python%d.%d"%sys.version_info[:2])')"
 
 # --- 3. Runtime files -----------------------------------------------------
 step "Installing app files to $DEST"
@@ -92,12 +92,19 @@ ok "Ollama running"
 step "Downloading cleanup model ($LLM_MODEL, ~5 GB) — grab a coffee"
 ollama pull "$LLM_MODEL" || warn "Model pull failed; cleanup will fall back to rules until you run: ollama pull $LLM_MODEL"
 
-step "Downloading speech model ($STT_MODEL) so the first dictation is instant"
-"$DEST/.venv/bin/python" - "$STT_MODEL" <<'PY' || warn "Speech-model prefetch skipped (downloads on first use instead)."
-import sys
-from faster_whisper import WhisperModel
-WhisperModel(sys.argv[1], device="cpu", compute_type="int8")
-print("  ok")
+step "Downloading speech model (large-v3-turbo, GPU) so the first dictation is instant"
+"$DEST/.venv/bin/python" <<'PY' || warn "Speech-model prefetch skipped (downloads on first use instead)."
+import numpy as np
+silence = np.zeros(16000, dtype="float32")
+try:
+    import mlx_whisper
+    mlx_whisper.transcribe(silence,
+                           path_or_hf_repo="mlx-community/whisper-large-v3-turbo")
+    print("  ok (mlx / GPU)")
+except Exception:
+    from faster_whisper import WhisperModel
+    WhisperModel("small", device="cpu", compute_type="int8")
+    print("  ok (faster-whisper / CPU fallback)")
 PY
 
 # --- 6. Build the app + autostart ----------------------------------------
@@ -116,26 +123,27 @@ osascript -e "tell application \"System Events\" to make login item at end with 
 step "Starting WhisperFlow"
 open "$APPDIR/WhisperFlow.app"
 sleep 3
-ok "launched — look for the 🎤 in your menu bar"
+ok "launched — look for the little Marvin face on your screen"
 
 cat <<EOF
 
 ${BOLD}${GREEN}Almost done — one manual step (macOS security).${RESET}
 
-WhisperFlow needs two permissions. macOS shows it as ${BOLD}"python3.12"${RESET}
+WhisperFlow needs two permissions. macOS shows it as ${BOLD}"$PYVER"${RESET}
 (not "WhisperFlow"), because the app runs on Python.
 
   1. System Settings → Privacy & Security → ${BOLD}Accessibility${RESET}
-       → turn ON the ${BOLD}python3.12${RESET} entry (add it with + if missing:
+       → turn ON the ${BOLD}$PYVER${RESET} entry (add it with + if missing:
          $PY )
   2. System Settings → Privacy & Security → ${BOLD}Input Monitoring${RESET}
-       → turn ON ${BOLD}python3.12${RESET} (same path if you need to add it)
-  3. Click the menu-bar 🎤 → Quit, then reopen WhisperFlow from Applications.
+       → turn ON ${BOLD}$PYVER${RESET} (same path if you need to add it)
+  3. Click the menu-bar Flow icon → Quit, then reopen WhisperFlow from Applications.
 
 Then: click into any text field, ${BOLD}hold Control+Shift+Space, speak, release${RESET}.
 Allow the Microphone prompt the first time. Works in Swedish and English.
+Marvin shakes/nods his head and his eyes glow while he listens.
 
-${BOLD}Change speed vs. accuracy${RESET} anytime: menu-bar 🎤 → Model.
+${BOLD}Settings${RESET} (model, language, sound): ${BOLD}right-click Marvin${RESET}.
 
 EOF
 read -r -p "Press Return to close this window."
