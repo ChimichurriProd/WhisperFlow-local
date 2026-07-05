@@ -6,7 +6,9 @@ stops when any of them is released. Transcription runs on a worker thread so
 the listener callback never blocks.
 
 Requires Input Monitoring (listener) and Accessibility (keystroke synthesis)
-permissions for your terminal: System Settings -> Privacy & Security.
+permissions for the running process: System Settings -> Privacy & Security.
+A watchdog force-stops recording if the release event is missed (macOS can
+disable the event tap under load) or a recording runs past a hard cap.
 """
 
 import sys
@@ -179,10 +181,20 @@ class PushToTalkApp:
 
     def on_press(self):
         if self._busy.locked():
+            # A previous transcription is still finishing; ignore this press
+            # (don't leave _active set, or the watchdog would spin on it).
+            self._active = False
             return
         print("[rec] listening...", flush=True)
         self._status("recording")
-        self.recorder.start()
+        try:
+            self.recorder.start()
+        except Exception as exc:
+            # Mic unavailable / permission denied: recover to idle instead of
+            # letting the exception break the listener callback.
+            print(f"[rec] could not start mic: {exc}", flush=True)
+            self._active = False
+            self._status("idle")
 
     def on_release(self):
         with self._busy:
@@ -196,6 +208,9 @@ class PushToTalkApp:
                     print("[stt] (nothing recognized)", flush=True)
                     return
                 cleaned = clean_transcript(raw, self.config)
+                if not cleaned:
+                    print("[out] (empty after cleanup, nothing to inject)", flush=True)
+                    return
                 print(f'[out] injecting into focused app: "{cleaned}"', flush=True)
                 self._wait_hotkey_released()
                 to_inject = cleaned

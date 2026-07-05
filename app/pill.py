@@ -5,8 +5,8 @@ Draggable anywhere; remembers where you put it. Click (without dragging)
 cycles the model. Hover reveals the current model.
 
 States:
-- idle:         a small glowing round dot
-- idle+hover:   expands to show the model ("small › byt")
+- idle:         a small glowing round dot (color+size reflect the model)
+- idle+hover:   expands to show the model ("Model: small")
 - recording:    expands, gradient waveform driven by mic level
 - transcribing: a gentle animated shimmer ("thinking")
 
@@ -17,19 +17,9 @@ isn't available, create_pill() returns None and the app still works headlessly.
 import math
 
 _HEIGHT = 32.0
-_WIDTH_IDLE = 32.0    # equals height => a round dot when idle
-_WIDTH_HOVER = 150.0  # idle + mouse over => reveal the model to switch it
-_WIDTH_REC = 250.0
+_WIDTH_IDLE = 32.0  # equals height => a round dot when idle
+_WIDTH_REC = 250.0  # hover width is measured from the label (see _target_width)
 _BARS = 24
-
-
-def create_pill(on_click=None, on_move=None, pos=None):
-    """Build and show the pill. Returns a controller, or None on failure."""
-    try:
-        return _Pill(on_click=on_click, on_move=on_move, pos=pos)
-    except Exception as exc:  # pragma: no cover - UI environment dependent
-        print(f"[pill] disabled ({exc})", flush=True)
-        return None
 
 
 try:
@@ -351,6 +341,14 @@ try:
                 if any(v > 0.001 for v in self.levels):
                     self.levels = [v * 0.6 for v in self.levels]
             self._render()
+
+    def create_pill(on_click=None, on_move=None, pos=None):
+        """Build and show the pill. Returns a controller, or None on failure."""
+        try:
+            return _Pill(on_click=on_click, on_move=on_move, pos=pos)
+        except Exception as exc:  # pragma: no cover - UI environment dependent
+            print(f"[pill] disabled ({exc})", flush=True)
+            return None
 
 except Exception as _pill_import_err:  # pragma: no cover - AppKit unavailable
     import traceback as _tb

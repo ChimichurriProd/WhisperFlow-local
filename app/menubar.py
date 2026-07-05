@@ -1,13 +1,9 @@
-"""Menu-bar mode: a status-bar icon wrapping the push-to-talk engine.
+"""Menu-bar mode: a status-bar title + the floating pill, wrapping the engine.
 
 The pynput listener runs on its own thread; rumps (AppKit) owns the main
-thread. The icon reflects pipeline state:
-
-    🎤  idle, listening for the hotkey
-    🔴  recording (hotkey held)
-    ✍️  transcribing / cleaning / injecting
-    ⏸  paused (listener stopped from the menu)
-    ⚠️  blocked (Accessibility not granted)
+thread. The menu-bar title (see ICONS) and the pill both reflect pipeline
+state: idle, recording, transcribing, paused, or blocked. The pill is the
+primary UI; the menu-bar title is a compact text fallback.
 """
 
 import json
@@ -86,11 +82,18 @@ class MenuBarApp(rumps.App):
             self.set_state("blocked")
 
     def _drive_pill(self, _timer):
+        # Runs on the main thread (rumps timer): the only safe place to touch
+        # AppKit. Sync the menu-bar title here from the thread-safe _mode flag
+        # instead of from worker threads.
+        mode = self._mode
+        title = ICONS.get(mode, ICONS["idle"])
+        if self.title != title:
+            self.title = title
+
         if self.pill is None:
             return
-        mode = self._mode
-        # 'blocked' shows as idle on the pill (permissions handled via menu).
-        pill_mode = "idle" if mode in ("idle", "blocked") else mode
+        # blocked/paused show as the idle dot (no active waveform).
+        pill_mode = "idle" if mode in ("idle", "blocked", "paused") else mode
         level = self.engine.recorder.level if pill_mode == "recording" else 0.0
         # Idle costs nothing once the waveform has settled (skip unless hovered).
         if (pill_mode == "idle" and not self.pill.hover
@@ -153,8 +156,9 @@ class MenuBarApp(rumps.App):
     # ---------------------------------------------------------------- state
 
     def set_state(self, state):
-        self.title = ICONS.get(state, ICONS["idle"])
-        self._mode = state  # picked up by the pill timer on the main thread
+        # Called from worker threads too, so only touch the plain flag here;
+        # the main-thread pill timer applies it to the AppKit title.
+        self._mode = state
 
     def toggle_pause(self, sender):
         if self.listener is not None:

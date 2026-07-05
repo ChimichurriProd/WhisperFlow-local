@@ -1,4 +1,8 @@
-"""CLI entrypoint: `python -m app` starts the push-to-talk loop (Windows)."""
+"""CLI entrypoint: `python -m app` starts the push-to-talk loop (macOS).
+
+Use --menubar for the menu-bar + floating-pill app; without it, a plain
+terminal process that logs to stdout.
+"""
 
 import argparse
 import sys
