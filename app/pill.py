@@ -91,21 +91,8 @@ try:
     def _hover_label(model):
         return f"Model: {model}"
 
-    # eye centroids per pose (normalized, y from top), measured from the assets
-    _POSE_EYES = {
-        "center": [(0.226, 0.639), (0.678, 0.633)],
-        "up":     [(0.243, 0.395), (0.669, 0.384)],
-        "down":   [(0.267, 0.818), (0.589, 0.819)],
-        "left":   [(0.334, 0.699), (0.646, 0.689)],
-        "right":  [(0.128, 0.645), (0.513, 0.636)],
-    }
-
     def _load_marvin_poses():
-        """Load the named 3D head poses (center/up/down/left/right) as NSImages.
-
-        Returns a dict {name: NSImage} for whichever exist. With 'center'
-        present the pill does a real look-around by cross-fading poses.
-        """
+        """Load the named 3D head poses (center/up/down/left/right) as NSImages."""
         from pathlib import Path
 
         d = Path(__file__).resolve().parent.parent / "assets" / "marvin"
@@ -118,6 +105,29 @@ try:
                     if img is not None:
                         poses[name] = img
         return poses
+
+    def _load_marvin_clips():
+        """Load frame-sequence clips from assets/marvin/<name>/frame_*.png.
+
+        Returns {name: [NSImage, ...]}. These are video-derived flipbooks
+        (e.g. 'shake', 'nod', 'spin') played back as real 3D motion.
+        """
+        from pathlib import Path
+
+        base = Path(__file__).resolve().parent.parent / "assets" / "marvin"
+        clips = {}
+        if base.is_dir():
+            for sub in base.iterdir():
+                if not sub.is_dir():
+                    continue
+                imgs = []
+                for f in sorted(sub.glob("frame_*.png")):
+                    img = NSImage.alloc().initWithContentsOfFile_(str(f))
+                    if img is not None:
+                        imgs.append(img)
+                if imgs:
+                    clips[sub.name] = imgs
+        return clips
 
     def _screen_with_mouse():
         p = NSEvent.mouseLocation()
@@ -213,10 +223,10 @@ try:
             h = self.frame().size.height
 
             if c.style == "marvin":
-                if c.poses.get("center") is not None:
-                    self._draw_marvin_poses(c, w, h)  # real 3D look-around
+                if c.clips or c.poses.get("center") is not None:
+                    self._draw_marvin_image(c, w, h)  # video flipbook / poses
                     return
-                # fallback (no pose assets): 2D fake tilt/nod on the vector face
+                # fallback (no assets): 2D fake tilt/nod on the vector face
                 NSGraphicsContext.saveGraphicsState()
                 t = NSAffineTransform.transform()
                 t.translateXBy_yBy_(0.0, c.nod)
@@ -270,61 +280,19 @@ try:
                 grad.drawInBezierPath_angle_(bar, 90.0)
 
         @objc.python_method
-        def _draw_marvin_poses(self, c, w, h):
-            """Cross-fade between 3D head poses for a real look-around, and glow
-            the current pose's eyes with voice."""
+        def _draw_marvin_image(self, c, w, h):
+            """Draw one Marvin frame: the current flipbook frame while a clip is
+            active (shake/spin), otherwise the still centre pose. Frames carry
+            their own glowing eyes, so no procedural glow is needed."""
             m = w * _MARVIN_INSET
-            rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
-            rect = NSMakeRect(rx, ry, rw, rh)
-            zero = NSMakeRect(0, 0, 0, 0)
-
-            # HARD CUT (cartoon): show exactly one pose — center, or the glance
-            # pose while a glance is active. No blending, no ghosting.
-            gdir = c._glance_dir if c._glance_dir in c.poses else None
-            img = c.poses[gdir] if gdir else c.poses["center"]
-
-            # The fraction/alpha draw API renders upside-down in a flipped view,
-            # so flip the context back around the head rect before drawing.
-            NSGraphicsContext.saveGraphicsState()
-            flip = NSAffineTransform.transform()
-            flip.translateXBy_yBy_(0.0, 2 * ry + rh)
-            flip.scaleXBy_yBy_(1.0, -1.0)
-            flip.concat()
-            img.drawInRect_fromRect_operation_fraction_(rect, zero, 2, 1.0)
-            NSGraphicsContext.restoreGraphicsState()
-
-            level = c.levels[-1] if c.levels else 0.0
-            glow = level if c.mode in ("recording", "transcribing") else 0.0
-            if glow > 0.04:
-                eyes = _POSE_EYES.get(gdir or "center", _POSE_EYES["center"])
-                # clip the bloom to a circle so it never shows a square edge
-                NSGraphicsContext.saveGraphicsState()
-                NSBezierPath.bezierPathWithOvalInRect_(
-                    NSMakeRect(w * 0.02, h * 0.02, w * 0.96, h * 0.96)
-                ).addClip()
-                self._eye_glow(rx, ry, rw, rh, eyes, glow)
-                NSGraphicsContext.restoreGraphicsState()
-
-        @objc.python_method
-        def _eye_glow(self, rx, ry, rw, rh, eyes, glow):
-            """Soft, feathered green bloom over both eyes (3 stacked radial
-            gradients so it fades gradually, not a hard disc)."""
-            core = min(0.6, glow * 0.8)
-            for nx, ny in eyes:
-                gx, gy = rx + nx * rw, ry + ny * rh
-                for scale, alpha in ((0.11, core), (0.20, core * 0.55),
-                                     (0.34, core * 0.28)):
-                    rad = rw * scale * (1.0 + glow * 0.4)
-                    grad = NSGradient.alloc().initWithColors_([
-                        _rgb(0.55, 1.0, 0.42, alpha),
-                        _rgb(0.55, 1.0, 0.42, 0.0),
-                    ])
-                    path = NSBezierPath.bezierPathWithOvalInRect_(
-                        NSMakeRect(gx - rad, gy - rad, 2 * rad, 2 * rad)
-                    )
-                    grad.drawInBezierPath_relativeCenterPosition_(
-                        path, NSMakePoint(0.0, 0.0)
-                    )
+            rect = NSMakeRect(m, m, w - 2 * m, h - 2 * m)
+            clip = c._active_clip(c.mode)
+            if clip:
+                img = clip[max(0, min(len(clip) - 1, int(c._clip_f)))]
+            else:
+                img = c.poses.get("center")
+            if img is not None:
+                img.drawInRect_(rect)  # simple draw is flip-safe and opaque
 
         @objc.python_method
         def _draw_marvin_vector(self, c, w, h):
@@ -435,17 +403,14 @@ try:
             self.model = "small"
             self.hover = False
             self.poses = _load_marvin_poses() if style == "marvin" else {}
+            self.clips = _load_marvin_clips() if style == "marvin" else {}
             self.levels = [0.0] * _BARS
             self._phase = 0.0
             self._anim = 0.0
-            self.tilt = 0.0  # head-roll degrees (fallback single-image only)
-            self.nod = 0.0   # vertical nod offset px (fallback single-image only)
-            # occasional glances while dictating; still (center) when idle
-            self._dirs = ["down", "left", "up", "right"]
-            self._dir_i = 0
-            self._glance_dir = None   # None = looking straight ahead
-            self._glance_t = 0.0      # progress through the current glance
-            self._glance_cd = 50      # ticks until the next glance
+            self.tilt = 0.0  # head-roll degrees (vector fallback only)
+            self.nod = 0.0   # vertical nod offset px (vector fallback only)
+            self._clip_f = 0.0   # current flipbook frame (float, ping-ponged)
+            self._clip_dir = 1
             self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
             self._w = _MARVIN_SIZE if style == "marvin" else _WIDTH_IDLE
 
@@ -559,24 +524,29 @@ try:
             self.tilt += (target - self.tilt) * 0.25
             self.nod += (nod_target - self.nod) * 0.25
 
-            # Glances: only while dictating. Hold center, then every so often
-            # flick to a direction and back. Perfectly still when idle.
-            if mode in ("recording", "transcribing"):
-                if self._glance_dir is None:
-                    self._glance_cd -= 1
-                    if self._glance_cd <= 0:
-                        self._glance_dir = self._dirs[self._dir_i]
-                        self._dir_i = (self._dir_i + 1) % len(self._dirs)
-                        self._glance_t = 0.0
-                else:
-                    self._glance_t += 0.05          # ~1s per glance
-                    if self._glance_t >= 1.0:
-                        self._glance_dir = None
-                        self._glance_cd = 55        # ~2.7s between glances
+            # Flipbook clip: play the shake while dictating (ping-pong so it
+            # loops seamlessly); hold still on the centre frame when idle.
+            clip = self._active_clip(mode)
+            if clip:
+                n = len(clip)
+                self._clip_f += self._clip_dir * 0.8
+                if self._clip_f >= n - 1:
+                    self._clip_f = n - 1
+                    self._clip_dir = -1
+                elif self._clip_f <= 0:
+                    self._clip_f = 0
+                    self._clip_dir = 1
             else:
-                self._glance_dir = None
-                self._glance_cd = 30
+                self._clip_f = 0.0
+                self._clip_dir = 1
             self._render()
+
+        def _active_clip(self, mode):
+            if mode == "recording":
+                return self.clips.get("shake")
+            if mode == "transcribing":
+                return self.clips.get("spin")  # played once ready
+            return None
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
                     style="waveform"):

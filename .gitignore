@@ -20,3 +20,4 @@ WhisperFlow.app/
 *.bin
 *.gguf
 models/
+assets/marvin/*.mp4
