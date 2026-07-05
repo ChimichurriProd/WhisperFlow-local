@@ -6,11 +6,12 @@ from pathlib import Path
 
 DEFAULTS = {
     "stt": {
-        "model": "small",
-        "device": "cpu",
-        "compute_type": "int8",
-        "language": None,  # auto-detect per utterance (e.g. Swedish/English)
-        "vad_filter": True,
+        "engine": "mlx",              # "mlx" (GPU, fast) | "faster-whisper" (CPU)
+        "model": "large-v3-turbo",    # best accuracy; ~0.2s on Apple Silicon GPU
+        "language": None,             # auto-detect per utterance (Swedish/English)
+        "vad_filter": True,           # faster-whisper only
+        "device": "cpu",              # faster-whisper only
+        "compute_type": "int8",       # faster-whisper only
     },
     "cleanup": {
         "ollama_url": "http://localhost:11434",

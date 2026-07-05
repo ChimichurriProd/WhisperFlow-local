@@ -20,11 +20,12 @@ ICONS = {"idle": "Flow", "recording": "● Rec", "transcribing": "Flow…",
          "paused": "Flow ‖", "blocked": "Flow ⚠"}
 
 # Model choices shown in the Model submenu: (config value, human label).
+# On the GPU (mlx) all are fast; the trade is accuracy, not speed.
 MODEL_CHOICES = [
-    ("base", "base — fastest (~1s)"),
-    ("small", "small — balanced (~2–3s)"),
-    ("medium", "medium — accurate (~5s)"),
-    ("large-v3-turbo", "large — most accurate (~10s)"),
+    ("base", "base — quickest, basic"),
+    ("small", "small — fast"),
+    ("medium", "medium — accurate"),
+    ("large-v3-turbo", "large — best accuracy"),
 ]
 
 

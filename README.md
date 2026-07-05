@@ -114,11 +114,12 @@ Set `injection.delivery_method` in `config.json`:
 ```json
 {
   "stt": {
-    "model": "large-v3-turbo", // tiny | base | small | medium | large-v3 | large-v3-turbo
-    "device": "cpu",
-    "compute_type": "int8",
+    "engine": "mlx",           // "mlx" = Apple-Silicon GPU (fast); "faster-whisper" = CPU
+    "model": "large-v3-turbo", // base | small | medium | large-v3-turbo
     "language": null,          // null = auto-detect (Swedish, English, ...); or "sv"/"en"
-    "vad_filter": true         // Silero VAD gates silence before Whisper
+    "vad_filter": true,        // faster-whisper only
+    "device": "cpu",           // faster-whisper only
+    "compute_type": "int8"     // faster-whisper only
   },
   "cleanup": {
     "ollama_url": "http://localhost:11434",
@@ -152,10 +153,11 @@ transcribe correctly instead of being mangled:
   (whole-word, case-insensitive). Use this for stubborn mishears — e.g.
   `"olama": "Ollama"`. Fixes are the final say, overriding STT and the LLM.
 
-**Model size vs. latency:** `tiny.en`/`base` respond near-instantly and are the
-right default for dictation. On an Apple Silicon Mac with plenty of RAM you can
-comfortably run `small`, `medium`, or `large-v3` for accuracy — CPU int8
-inference via CTranslate2 is still fast.
+**Speed:** with the default `mlx` engine (Apple-Silicon GPU), even
+`large-v3-turbo` transcribes a short utterance in ~0.2s — so the default is the
+most *accurate* model and it still feels instant. On the GPU, model choice is
+about accuracy, not speed. The `faster-whisper` (CPU) engine is the portable
+fallback and is much slower on Mac. First use of each model downloads it once.
 
 ## Verify without a microphone
 

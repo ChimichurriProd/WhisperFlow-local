@@ -1,10 +1,11 @@
 {
   "stt": {
-    "model": "small",
-    "device": "cpu",
-    "compute_type": "int8",
+    "engine": "mlx",
+    "model": "large-v3-turbo",
     "language": null,
-    "vad_filter": true
+    "vad_filter": true,
+    "device": "cpu",
+    "compute_type": "int8"
   },
   "cleanup": {
     "ollama_url": "http://localhost:11434",
