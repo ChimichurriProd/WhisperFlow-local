@@ -91,23 +91,33 @@ try:
     def _hover_label(model):
         return f"Model: {model}"
 
-    def _load_marvin_frames():
-        """Load assets/marvin/*.png sorted (closed -> open) as NSImages.
+    # eye centroids per pose (normalized, y from top), measured from the assets
+    _POSE_EYES = {
+        "center": [(0.226, 0.639), (0.678, 0.633)],
+        "up":     [(0.243, 0.395), (0.669, 0.384)],
+        "down":   [(0.267, 0.818), (0.589, 0.819)],
+        "left":   [(0.334, 0.699), (0.646, 0.689)],
+        "right":  [(0.128, 0.645), (0.513, 0.636)],
+    }
 
-        If present, the pill lip-syncs these frames to your voice; if the
-        folder is empty/missing, it falls back to the drawn vector face.
+    def _load_marvin_poses():
+        """Load the named 3D head poses (center/up/down/left/right) as NSImages.
+
+        Returns a dict {name: NSImage} for whichever exist. With 'center'
+        present the pill does a real look-around by cross-fading poses.
         """
         from pathlib import Path
 
         d = Path(__file__).resolve().parent.parent / "assets" / "marvin"
-        if not d.is_dir():
-            return []
-        frames = []
-        for f in sorted(d.glob("*.png")):
-            img = NSImage.alloc().initWithContentsOfFile_(str(f))
-            if img is not None:
-                frames.append(img)
-        return frames
+        poses = {}
+        if d.is_dir():
+            for name in ("center", "up", "down", "left", "right"):
+                p = d / f"{name}.png"
+                if p.exists():
+                    img = NSImage.alloc().initWithContentsOfFile_(str(p))
+                    if img is not None:
+                        poses[name] = img
+        return poses
 
     def _screen_with_mouse():
         p = NSEvent.mouseLocation()
@@ -203,14 +213,18 @@ try:
             h = self.frame().size.height
 
             if c.style == "marvin":
+                if c.poses.get("center") is not None:
+                    self._draw_marvin_poses(c, w, h)  # real 3D look-around
+                    return
+                # fallback (no pose assets): 2D fake tilt/nod on the vector face
                 NSGraphicsContext.saveGraphicsState()
                 t = NSAffineTransform.transform()
-                t.translateXBy_yBy_(0.0, c.nod)          # vertical nod (fake pitch)
+                t.translateXBy_yBy_(0.0, c.nod)
                 t.translateXBy_yBy_(w / 2.0, h / 2.0)
-                t.rotateByDegrees_(c.tilt)               # head roll (listening)
+                t.rotateByDegrees_(c.tilt)
                 t.translateXBy_yBy_(-w / 2.0, -h / 2.0)
                 t.concat()
-                self._draw_marvin(c, w, h)
+                self._draw_marvin_vector(c, w, h)
                 NSGraphicsContext.restoreGraphicsState()
                 return
 
@@ -255,35 +269,49 @@ try:
                 )
                 grad.drawInBezierPath_angle_(bar, 90.0)
 
-        # eye centroids in the head image (normalized, y from top)
-        _EYES = ((0.246, 0.629), (0.744, 0.632))
+        @objc.python_method
+        def _draw_marvin_poses(self, c, w, h):
+            """Cross-fade between 3D head poses for a real look-around, and glow
+            the current pose's eyes with voice."""
+            m = w * _MARVIN_INSET
+            rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
+            rect = NSMakeRect(rx, ry, rw, rh)
+            zero = NSMakeRect(0, 0, 0, 0)
+
+            n = len(c._look_seq)
+            cur = c._look_seq[c._look_i]
+            nxt = c._look_seq[(c._look_i + 1) % n]
+            t = c._look_t
+            blend = t * t * (3 - 2 * t)  # smoothstep ease
+            src = c.poses.get(cur) or c.poses["center"]
+            dst = c.poses.get(nxt) or c.poses["center"]
+
+            # The fraction/alpha draw API does not auto-compensate for the
+            # flipped view (it renders upside-down), so flip the context back
+            # around the head rect before drawing the images.
+            NSGraphicsContext.saveGraphicsState()
+            flip = NSAffineTransform.transform()
+            flip.translateXBy_yBy_(0.0, 2 * ry + rh)
+            flip.scaleXBy_yBy_(1.0, -1.0)
+            flip.concat()
+            src.drawInRect_fromRect_operation_fraction_(rect, zero, 2, 1.0)   # SourceOver
+            if blend > 0.001:
+                dst.drawInRect_fromRect_operation_fraction_(rect, zero, 2, blend)
+            NSGraphicsContext.restoreGraphicsState()
+
+            level = c.levels[-1] if c.levels else 0.0
+            glow = level if c.mode in ("recording", "transcribing") else 0.0
+            if glow > 0.04:
+                dom = nxt if blend >= 0.5 else cur
+                eyes = _POSE_EYES.get(dom, _POSE_EYES["center"])
+                self._eye_glow(rx, ry, rw, rh, eyes, glow)
 
         @objc.python_method
-        def _draw_marvin(self, c, w, h):
-            """Marvin: the head image (inset so it can move without clipping),
-            with eyes that glow/flicker with voice."""
-            frames = c.frames
-            if frames:
-                m = w * _MARVIN_INSET
-                rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
-                frames[0].drawInRect_(NSMakeRect(rx, ry, rw, rh))
-                level = c.levels[-1] if c.levels else 0.0
-                glow = level if c.mode in ("recording", "transcribing") else 0.0
-                if glow > 0.04:
-                    self._eye_glow(rx, ry, rw, rh, glow)
-                return
-            self._draw_marvin_vector(c, w, h)
-
-        @objc.python_method
-        def _eye_glow(self, rx, ry, rw, rh, glow):
-            """Soft, feathered green bloom over BOTH eyes, intensity = loudness.
-
-            Three stacked radial gradients (core -> soft -> wide halo) so it
-            fades out gradually instead of looking like a hard disc. Positions
-            are relative to the (inset) head rect.
-            """
+        def _eye_glow(self, rx, ry, rw, rh, eyes, glow):
+            """Soft, feathered green bloom over both eyes (3 stacked radial
+            gradients so it fades gradually, not a hard disc)."""
             core = min(0.6, glow * 0.8)
-            for nx, ny in self._EYES:
+            for nx, ny in eyes:
                 gx, gy = rx + nx * rw, ry + ny * rh
                 for scale, alpha in ((0.11, core), (0.20, core * 0.55),
                                      (0.34, core * 0.28)):
@@ -407,12 +435,17 @@ try:
             self.mode = "idle"
             self.model = "small"
             self.hover = False
-            self.frames = _load_marvin_frames() if style == "marvin" else []
+            self.poses = _load_marvin_poses() if style == "marvin" else {}
             self.levels = [0.0] * _BARS
             self._phase = 0.0
             self._anim = 0.0
-            self.tilt = 0.0  # head-roll degrees (marvin style)
-            self.nod = 0.0   # vertical nod offset in px (fake pitch)
+            self.tilt = 0.0  # head-roll degrees (fallback single-image only)
+            self.nod = 0.0   # vertical nod offset px (fallback single-image only)
+            # look-around sequence: glance to a direction and back to centre
+            self._look_seq = ["center", "down", "center", "left",
+                              "center", "up", "center", "right"]
+            self._look_i = 0
+            self._look_t = 0.0
             self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
             self._w = _MARVIN_SIZE if style == "marvin" else _WIDTH_IDLE
 
@@ -525,6 +558,14 @@ try:
                 nod_target = 1.0 * math.sin(self._anim * 1.1)
             self.tilt += (target - self.tilt) * 0.25
             self.nod += (nod_target - self.nod) * 0.25
+
+            # 3D look-around: advance through the glance sequence (faster while
+            # dictating, a slow idle glance otherwise).
+            speed = 0.045 if mode in ("recording", "transcribing") else 0.012
+            self._look_t += speed
+            if self._look_t >= 1.0:
+                self._look_t = 0.0
+                self._look_i = (self._look_i + 1) % len(self._look_seq)
             self._render()
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
