@@ -278,31 +278,38 @@ try:
             rect = NSMakeRect(rx, ry, rw, rh)
             zero = NSMakeRect(0, 0, 0, 0)
 
-            n = len(c._look_seq)
-            cur = c._look_seq[c._look_i]
-            nxt = c._look_seq[(c._look_i + 1) % n]
-            t = c._look_t
-            blend = t * t * (3 - 2 * t)  # smoothstep ease
-            src = c.poses.get(cur) or c.poses["center"]
-            dst = c.poses.get(nxt) or c.poses["center"]
+            center = c.poses["center"]
+            gdir = c._glance_dir
+            glance = c.poses.get(gdir) if gdir else None
+            # fast-in / hold / fast-out: the glance pose is drawn fully opaque
+            # during the hold (no ghosting); only the brief ramps overlap.
+            if glance is not None:
+                t = c._glance_t
+                if t < 0.22:
+                    b = t / 0.22
+                elif t > 0.78:
+                    b = (1.0 - t) / 0.22
+                else:
+                    b = 1.0
+            else:
+                b = 0.0
 
-            # The fraction/alpha draw API does not auto-compensate for the
-            # flipped view (it renders upside-down), so flip the context back
-            # around the head rect before drawing the images.
+            # The fraction/alpha draw API renders upside-down in a flipped view,
+            # so flip the context back around the head rect before drawing.
             NSGraphicsContext.saveGraphicsState()
             flip = NSAffineTransform.transform()
             flip.translateXBy_yBy_(0.0, 2 * ry + rh)
             flip.scaleXBy_yBy_(1.0, -1.0)
             flip.concat()
-            src.drawInRect_fromRect_operation_fraction_(rect, zero, 2, 1.0)   # SourceOver
-            if blend > 0.001:
-                dst.drawInRect_fromRect_operation_fraction_(rect, zero, 2, blend)
+            center.drawInRect_fromRect_operation_fraction_(rect, zero, 2, 1.0)
+            if b > 0.001 and glance is not None:
+                glance.drawInRect_fromRect_operation_fraction_(rect, zero, 2, b)
             NSGraphicsContext.restoreGraphicsState()
 
             level = c.levels[-1] if c.levels else 0.0
             glow = level if c.mode in ("recording", "transcribing") else 0.0
             if glow > 0.04:
-                dom = nxt if blend >= 0.5 else cur
+                dom = gdir if (glance is not None and b >= 0.6) else "center"
                 eyes = _POSE_EYES.get(dom, _POSE_EYES["center"])
                 self._eye_glow(rx, ry, rw, rh, eyes, glow)
 
@@ -441,11 +448,12 @@ try:
             self._anim = 0.0
             self.tilt = 0.0  # head-roll degrees (fallback single-image only)
             self.nod = 0.0   # vertical nod offset px (fallback single-image only)
-            # look-around sequence: glance to a direction and back to centre
-            self._look_seq = ["center", "down", "center", "left",
-                              "center", "up", "center", "right"]
-            self._look_i = 0
-            self._look_t = 0.0
+            # occasional glances while dictating; still (center) when idle
+            self._dirs = ["down", "left", "up", "right"]
+            self._dir_i = 0
+            self._glance_dir = None   # None = looking straight ahead
+            self._glance_t = 0.0      # progress through the current glance
+            self._glance_cd = 50      # ticks until the next glance
             self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
             self._w = _MARVIN_SIZE if style == "marvin" else _WIDTH_IDLE
 
@@ -559,13 +567,23 @@ try:
             self.tilt += (target - self.tilt) * 0.25
             self.nod += (nod_target - self.nod) * 0.25
 
-            # 3D look-around: advance through the glance sequence (faster while
-            # dictating, a slow idle glance otherwise).
-            speed = 0.045 if mode in ("recording", "transcribing") else 0.012
-            self._look_t += speed
-            if self._look_t >= 1.0:
-                self._look_t = 0.0
-                self._look_i = (self._look_i + 1) % len(self._look_seq)
+            # Glances: only while dictating. Hold center, then every so often
+            # flick to a direction and back. Perfectly still when idle.
+            if mode in ("recording", "transcribing"):
+                if self._glance_dir is None:
+                    self._glance_cd -= 1
+                    if self._glance_cd <= 0:
+                        self._glance_dir = self._dirs[self._dir_i]
+                        self._dir_i = (self._dir_i + 1) % len(self._dirs)
+                        self._glance_t = 0.0
+                else:
+                    self._glance_t += 0.05          # ~1s per glance
+                    if self._glance_t >= 1.0:
+                        self._glance_dir = None
+                        self._glance_cd = 55        # ~2.7s between glances
+            else:
+                self._glance_dir = None
+                self._glance_cd = 30
             self._render()
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
