@@ -47,6 +47,9 @@ DEFAULTS = {
         "start": "Tink",  # any name from /System/Library/Sounds
         "done": "Pop",
     },
+    "ui": {
+        "pill_style": "marvin",  # "marvin" (face) | "waveform" (bars)
+    },
 }
 
 VALID_DELIVERY_METHODS = ("clipboard", "type")

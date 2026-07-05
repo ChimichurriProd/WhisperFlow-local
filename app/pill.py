@@ -20,6 +20,7 @@ _HEIGHT = 32.0
 _WIDTH_IDLE = 32.0  # equals height => a round dot when idle
 _WIDTH_REC = 250.0  # hover width is measured from the label (see _target_width)
 _BARS = 24
+_MARVIN_SIZE = 64.0  # the round Marvin face is a fixed square
 
 
 try:
@@ -33,6 +34,7 @@ try:
         NSFontAttributeName,
         NSForegroundColorAttributeName,
         NSGradient,
+        NSEventModifierFlagControl,
         NSMakePoint,
         NSMakeRect,
         NSScreen,
@@ -134,13 +136,22 @@ try:
 
         # -------- drag to move / click to cycle ---------------------------
 
+        def rightMouseDown_(self, event):
+            if self._c.on_menu:
+                self._c.on_menu(self, event)
+
         def mouseDown_(self, event):
+            # Control-click = right-click: open the menu instead of dragging.
+            if (event.modifierFlags() & NSEventModifierFlagControl) and self._c.on_menu:
+                self._c.on_menu(self, event)
+                self._down = None
+                return
             self._down = NSEvent.mouseLocation()
             self._win0 = self.window().frame().origin
             self._dragged = False
 
         def mouseDragged_(self, event):
-            if self._down is None:
+            if self._down is None:  # e.g. a control-click opened the menu
                 return
             cur = NSEvent.mouseLocation()
             dx, dy = cur.x - self._down.x, cur.y - self._down.y
@@ -168,6 +179,10 @@ try:
             c = self._c
             w = self.frame().size.width
             h = self.frame().size.height
+
+            if c.style == "marvin":
+                self._draw_marvin(c, w, h)
+                return
 
             # subtle dark tint over the frosted glass for contrast + a hairline
             path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
@@ -211,6 +226,73 @@ try:
                 grad.drawInBezierPath_angle_(bar, 90.0)
 
         @objc.python_method
+        def _draw_marvin(self, c, w, h):
+            """Marvin the Paranoid Android: a glum round face whose mouth opens
+            with your voice while dictating."""
+            cx, cy = w / 2.0, h / 2.0
+            R = min(w, h) / 2.0 - 3.0
+            dark = (0.13, 0.13, 0.16)
+            green = (0.49, 0.83, 0.13)
+
+            # head
+            face = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(cx - R, cy - R, 2 * R, 2 * R)
+            )
+            _rgb(0.93, 0.92, 0.87, 1.0).setFill()
+            face.fill()
+            _rgb(*dark).setStroke()
+            face.setLineWidth_(max(2.0, R * 0.06))
+            face.stroke()
+
+            # brow line (slightly above the equator, like the reference)
+            brow_y = cy - R * 0.02
+            half = R * 0.80
+            brow = NSBezierPath.bezierPath()
+            brow.moveToPoint_(NSMakePoint(cx - half, brow_y))
+            brow.lineToPoint_(NSMakePoint(cx + half, brow_y))
+            brow.setLineWidth_(max(2.0, R * 0.05))
+            _rgb(*dark).setStroke()
+            brow.stroke()
+
+            # two big downward green triangle eyes hanging from the brow
+            ew, eh = R * 0.42, R * 0.60
+            for ex in (cx - R * 0.36, cx + R * 0.36):
+                tri = NSBezierPath.bezierPath()
+                tri.moveToPoint_(NSMakePoint(ex - ew / 2, brow_y + 1))
+                tri.lineToPoint_(NSMakePoint(ex + ew / 2, brow_y + 1))
+                tri.lineToPoint_(NSMakePoint(ex, brow_y + eh))
+                tri.closePath()
+                _rgb(*green).setFill()
+                tri.fill()
+                _rgb(*dark).setStroke()
+                tri.setLineWidth_(1.5)
+                tri.stroke()
+
+            # mouth: a glum closed curve when idle; opens with voice when talking
+            level = c.levels[-1] if c.levels else 0.0
+            openness = level if c.mode in ("recording", "transcribing") else 0.0
+            my = cy + R * 0.66
+            if openness < 0.06:
+                mouth = NSBezierPath.bezierPath()
+                mouth.moveToPoint_(NSMakePoint(cx - R * 0.34, my))
+                mouth.curveToPoint_controlPoint1_controlPoint2_(
+                    NSMakePoint(cx + R * 0.34, my),
+                    NSMakePoint(cx - R * 0.12, my + R * 0.14),
+                    NSMakePoint(cx + R * 0.12, my + R * 0.14),
+                )
+                mouth.setLineWidth_(max(1.8, R * 0.045))
+                _rgb(*dark).setStroke()
+                mouth.stroke()
+            else:
+                mw = R * 0.62
+                mh = R * 0.10 + min(1.0, openness) * R * 0.28  # wider than tall
+                oval = NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect(cx - mw / 2, my - mh / 2, mw, mh)
+                )
+                _rgb(0.10, 0.10, 0.12, 1.0).setFill()
+                oval.fill()
+
+        @objc.python_method
         def _glow_dot(self, cx, cy, radius, rgb):
             r, g, b = rgb
             # soft halo
@@ -240,25 +322,29 @@ try:
             )
 
     class _Pill:
-        def __init__(self, on_click=None, on_move=None, pos=None):
+        def __init__(self, on_click=None, on_move=None, on_menu=None, pos=None,
+                     style="waveform"):
             self.on_click = on_click
             self.on_move = on_move
+            self.on_menu = on_menu
+            self.style = style
             self.mode = "idle"
             self.model = "small"
             self.hover = False
             self.levels = [0.0] * _BARS
             self._phase = 0.0
-            self._w = _WIDTH_IDLE
+            self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
+            self._w = _MARVIN_SIZE if style == "marvin" else _WIDTH_IDLE
 
             if pos and len(pos) == 2 and pos[0] is not None:
                 x, y = float(pos[0]), float(pos[1])
             else:
                 screen = _screen_with_mouse().frame()
-                x = screen.origin.x + (screen.size.width - _WIDTH_IDLE) / 2.0
-                y = screen.origin.y + screen.size.height - _HEIGHT - 64.0
+                x = screen.origin.x + (screen.size.width - self._w) / 2.0
+                y = screen.origin.y + screen.size.height - self._h - 64.0
 
             self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(x, y, self._w, _HEIGHT),
+                NSMakeRect(x, y, self._w, self._h),
                 NSWindowStyleMaskBorderless,
                 NSBackingStoreBuffered,
                 False,
@@ -272,22 +358,25 @@ try:
                 | NSWindowCollectionBehaviorStationary
             )
 
-            # frosted-glass content, rounded to a pill
+            # frosted-glass content, rounded (a pill for waveform, circle for
+            # Marvin since width == height). Marvin draws an opaque face on top.
             fx = NSVisualEffectView.alloc().initWithFrame_(
-                NSMakeRect(0, 0, self._w, _HEIGHT)
+                NSMakeRect(0, 0, self._w, self._h)
             )
             fx.setMaterial_(NSVisualEffectMaterialHUDWindow)
             fx.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
             fx.setState_(NSVisualEffectStateActive)
             fx.setWantsLayer_(True)
-            fx.layer().setCornerRadius_(_HEIGHT / 2.0)
+            fx.layer().setCornerRadius_(self._h / 2.0)
             fx.layer().setMasksToBounds_(True)
+            if style == "marvin":
+                fx.setHidden_(True)  # face is opaque; no glass needed behind it
             self.window.setContentView_(fx)
 
             self.view = _WaveView.alloc().initWithController_(self)
-            self.view.setFrame_(NSMakeRect(0, 0, self._w, _HEIGHT))
+            self.view.setFrame_(NSMakeRect(0, 0, self._w, self._h))
             self.view.setAutoresizingMask_(1 << 1 | 1 << 4)  # width | height
-            fx.addSubview_(self.view)
+            self.window.setContentView_(self.view) if style == "marvin" else fx.addSubview_(self.view)
             self.window.orderFrontRegardless()
 
         def _resize(self, width, animate=True):
@@ -295,7 +384,7 @@ try:
                 return
             self._w = width
             f = self.window.frame()
-            new = NSMakeRect(f.origin.x, f.origin.y, width, _HEIGHT)  # left-anchored
+            new = NSMakeRect(f.origin.x, f.origin.y, width, self._h)  # left-anchored
             if animate:
                 NSAnimationContext.beginGrouping()
                 NSAnimationContext.currentContext().setDuration_(0.16)
@@ -315,6 +404,8 @@ try:
             self._render()
 
         def _target_width(self):
+            if self.style == "marvin":
+                return _MARVIN_SIZE  # face stays a fixed circle
             if self.mode in ("recording", "transcribing"):
                 return _WIDTH_REC
             if self.hover:
@@ -342,10 +433,12 @@ try:
                     self.levels = [v * 0.6 for v in self.levels]
             self._render()
 
-    def create_pill(on_click=None, on_move=None, pos=None):
+    def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
+                    style="waveform"):
         """Build and show the pill. Returns a controller, or None on failure."""
         try:
-            return _Pill(on_click=on_click, on_move=on_move, pos=pos)
+            return _Pill(on_click=on_click, on_move=on_move,
+                         on_menu=on_menu, pos=pos, style=style)
         except Exception as exc:  # pragma: no cover - UI environment dependent
             print(f"[pill] disabled ({exc})", flush=True)
             return None
@@ -355,5 +448,6 @@ except Exception as _pill_import_err:  # pragma: no cover - AppKit unavailable
     print(f"[pill] UI unavailable: {_pill_import_err!r}", flush=True)
     _tb.print_exc()
 
-    def create_pill(on_click=None, on_move=None, pos=None):
+    def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
+                    style="waveform"):
         return None

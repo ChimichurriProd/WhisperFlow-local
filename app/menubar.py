@@ -9,10 +9,32 @@ primary UI; the menu-bar title is a compact text fallback.
 import json
 
 import rumps
+from AppKit import NSMenu, NSMenuItem
+from Foundation import NSObject
+import objc
 
 from .hotkey import PushToTalkApp
 from .permissions import is_trusted, prompt_for_trust
 from .pill import create_pill
+
+
+class _MenuTarget(NSObject):
+    """Objective-C action target that dispatches menu clicks to Python callables
+    stored (by tag) on the owning app — used for the pill's right-click menu.
+    """
+
+    def initWithApp_(self, app):
+        self = objc.super(_MenuTarget, self).init()
+        if self is None:
+            return None
+        self._app = app
+        return self
+
+    def fire_(self, sender):
+        cbs = getattr(self._app, "_menu_callbacks", [])
+        idx = sender.tag()
+        if 0 <= idx < len(cbs):
+            cbs[idx]()
 
 # Plain-text titles: emoji can render as an invisible glyph in the macOS menu
 # bar on some systems, so we use short text labels that always show.
@@ -73,8 +95,12 @@ class MenuBarApp(rumps.App):
         self._mode = "blocked" if not trusted else "idle"
         saved = config.get("pill", {})
         pos = (saved.get("x"), saved.get("y")) if "x" in saved else None
+        self._menu_target = _MenuTarget.alloc().initWithApp_(self)
+        self._menu_callbacks = []
         self.pill = create_pill(
-            on_click=self.cycle_model, on_move=self._save_pill_pos, pos=pos
+            on_click=self.cycle_model, on_move=self._save_pill_pos,
+            on_menu=self.show_pill_menu, pos=pos,
+            style=config.get("ui", {}).get("pill_style", "waveform"),
         )
         if self.pill is not None:
             self.pill.set_model(config["stt"]["model"])
@@ -145,26 +171,121 @@ class MenuBarApp(rumps.App):
         return menu
 
     def _make_lang_cb(self, code):
-        return lambda _sender: self._select_language(code)
+        return lambda _sender: self._apply_language(code)
 
-    def _select_language(self, code):
+    # Setters: single source of truth so the menu-bar Settings items and the
+    # pill's right-click menu stay in sync.
+
+    def _apply_language(self, code):
         self.engine.set_language(code)
         for c, item in self._lang_items.items():
             item.state = 1 if c == code else 0
         self._save_config()
 
-    def _toggle_cleanup(self, sender):
-        new = not self.config["cleanup"].get("enabled", True)
-        self.config["cleanup"]["enabled"] = new
-        sender.state = 1 if new else 0
+    def _apply_cleanup(self, enabled):
+        self.config["cleanup"]["enabled"] = enabled
+        self._cleanup_item.state = 1 if enabled else 0
         self._save_config()
 
-    def _toggle_sound(self, sender):
-        cues = self.config.setdefault("sound_cues", {})
-        new = not cues.get("enabled", True)
-        cues["enabled"] = new
-        sender.state = 1 if new else 0
+    def _apply_sound(self, enabled):
+        self.config.setdefault("sound_cues", {})["enabled"] = enabled
+        self._sound_item.state = 1 if enabled else 0
         self._save_config()
+
+    def _toggle_cleanup(self, _sender):
+        self._apply_cleanup(not self.config["cleanup"].get("enabled", True))
+
+    def _toggle_sound(self, _sender):
+        self._apply_sound(not self.config.get("sound_cues", {}).get("enabled", True))
+
+    def set_pill_style(self, style):
+        """Switch the on-screen indicator between the Marvin face and the
+        waveform bar. Recreates the pill window (sizes differ)."""
+        self.config.setdefault("ui", {})["pill_style"] = style
+        self._save_config()
+        saved = self.config.get("pill", {})
+        pos = (saved.get("x"), saved.get("y")) if "x" in saved else None
+        if self.pill is not None:
+            try:
+                self.pill.window.close()
+            except Exception:
+                pass
+        self.pill = create_pill(
+            on_click=self.cycle_model, on_move=self._save_pill_pos,
+            on_menu=self.show_pill_menu, pos=pos, style=style,
+        )
+        if self.pill is not None:
+            self.pill.set_model(self.config["stt"]["model"])
+
+    # ------------------------------------------------- pill right-click menu
+
+    def show_pill_menu(self, view, event):
+        """Build and pop up a native menu at the pill (right/control-click)."""
+        menu = NSMenu.alloc().init()
+        menu.setAutoenablesItems_(False)
+        self._menu_callbacks = []
+
+        def add(title, cb, parent, state=0, enabled=True):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, "fire:", ""
+            )
+            item.setTarget_(self._menu_target)
+            item.setTag_(len(self._menu_callbacks))
+            item.setState_(1 if state else 0)
+            item.setEnabled_(enabled)
+            self._menu_callbacks.append(cb)
+            parent.addItem_(item)
+
+        def submenu(title):
+            parent_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, None, ""
+            )
+            sub = NSMenu.alloc().init()
+            sub.setAutoenablesItems_(False)
+            parent_item.setSubmenu_(sub)
+            menu.addItem_(parent_item)
+            return sub
+
+        header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "WhisperFlow", None, ""
+        )
+        header.setEnabled_(False)
+        menu.addItem_(header)
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        cur_model = self.config["stt"]["model"]
+        model_sub = submenu("Model")
+        for val, label in MODEL_CHOICES:
+            add(label, (lambda v=val: self.select_model(v)), model_sub,
+                state=(val == cur_model))
+
+        cur_lang = self.config["stt"].get("language")
+        lang_sub = submenu("Language")
+        for label, code in self._LANGUAGES:
+            add(label, (lambda c=code: self._apply_language(c)), lang_sub,
+                state=(code == cur_lang))
+
+        cur_style = self.config.get("ui", {}).get("pill_style", "waveform")
+        look_sub = submenu("Appearance")
+        for val, label in (("marvin", "Marvin face"), ("waveform", "Waveform")):
+            add(label, (lambda v=val: self.set_pill_style(v)), look_sub,
+                state=(val == cur_style))
+
+        menu.addItem_(NSMenuItem.separatorItem())
+        cleanup_on = self.config["cleanup"].get("enabled", True)
+        add("AI cleanup", lambda: self._apply_cleanup(not cleanup_on), menu,
+            state=cleanup_on)
+        sound_on = self.config.get("sound_cues", {}).get("enabled", True)
+        add("Sound cues", lambda: self._apply_sound(not sound_on), menu,
+            state=sound_on)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+        paused = self.listener is None
+        add("Resume listening" if paused else "Pause listening",
+            lambda: self.toggle_pause(self.pause_item), menu)
+        add("Quit WhisperFlow", lambda: rumps.quit_application(), menu)
+
+        NSMenu.popUpContextMenu_withEvent_forView_(menu, event, view)
 
     # ---------------------------------------------------------------- model
 
