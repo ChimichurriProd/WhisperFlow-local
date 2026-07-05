@@ -107,15 +107,17 @@ try:
         return poses
 
     def _load_marvin_clips():
-        """Load frame-sequence clips from assets/marvin/<name>/frame_*.png.
+        """Load frame-sequence clips from assets/marvin/<name>/frame_*.png plus
+        per-frame eye positions from <name>/eyes.json.
 
-        Returns {name: [NSImage, ...]}. These are video-derived flipbooks
-        (e.g. 'shake', 'nod', 'spin') played back as real 3D motion.
+        Returns (clips, eyes): clips={name:[NSImage,...]}, eyes={name:[[(lx,ly),
+        (rx,ry)],...]} for the voice-reactive glow.
         """
+        import json
         from pathlib import Path
 
         base = Path(__file__).resolve().parent.parent / "assets" / "marvin"
-        clips = {}
+        clips, eyes = {}, {}
         if base.is_dir():
             for sub in base.iterdir():
                 if not sub.is_dir():
@@ -127,7 +129,13 @@ try:
                         imgs.append(img)
                 if imgs:
                     clips[sub.name] = imgs
-        return clips
+                    ej = sub / "eyes.json"
+                    if ej.exists():
+                        try:
+                            eyes[sub.name] = json.loads(ej.read_text())
+                        except Exception:
+                            pass
+        return clips, eyes
 
     def _screen_with_mouse():
         p = NSEvent.mouseLocation()
@@ -281,18 +289,56 @@ try:
 
         @objc.python_method
         def _draw_marvin_image(self, c, w, h):
-            """Draw one Marvin frame: the current flipbook frame while a clip is
-            active (shake/spin), otherwise the still centre pose. Frames carry
-            their own glowing eyes, so no procedural glow is needed."""
+            """Draw one Marvin frame (the current flipbook frame while a clip is
+            active, else the still centre pose) and, while dictating, add a
+            voice-reactive green bloom over the frame's eyes."""
             m = w * _MARVIN_INSET
-            rect = NSMakeRect(m, m, w - 2 * m, h - 2 * m)
-            clip = c._active_clip(c.mode)
+            rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
+            rect = NSMakeRect(rx, ry, rw, rh)
+
+            name = c._active_clip_name(c.mode)
+            clip = c.clips.get(name) if name else None
+            fi = 0
             if clip:
-                img = clip[max(0, min(len(clip) - 1, int(c._clip_f)))]
+                fi = max(0, min(len(clip) - 1, int(c._clip_f)))
+                img = clip[fi]
             else:
                 img = c.poses.get("center")
-            if img is not None:
-                img.drawInRect_(rect)  # simple draw is flip-safe and opaque
+            if img is None:
+                return
+            img.drawInRect_(rect)  # simple draw is flip-safe and opaque
+
+            level = c.levels[-1] if c.levels else 0.0
+            if c.mode == "recording" and level > 0.05 and name:
+                eyes_seq = c.clip_eyes.get(name)
+                if eyes_seq and fi < len(eyes_seq):
+                    NSGraphicsContext.saveGraphicsState()
+                    NSBezierPath.bezierPathWithOvalInRect_(
+                        NSMakeRect(w * 0.02, h * 0.02, w * 0.96, h * 0.96)
+                    ).addClip()
+                    self._eye_glow(rx, ry, rw, rh, eyes_seq[fi], level)
+                    NSGraphicsContext.restoreGraphicsState()
+
+        @objc.python_method
+        def _eye_glow(self, rx, ry, rw, rh, eyes, glow):
+            """Soft feathered green bloom over each eye (stacked radial gradients
+            so it fades gradually), scaled by loudness."""
+            core = min(0.65, glow * 0.85)
+            for nx, ny in eyes:
+                gx, gy = rx + nx * rw, ry + ny * rh
+                for scale, alpha in ((0.08, core), (0.15, core * 0.5),
+                                     (0.24, core * 0.25)):
+                    rad = rw * scale * (1.0 + glow * 0.4)
+                    grad = NSGradient.alloc().initWithColors_([
+                        _rgb(0.60, 1.0, 0.45, alpha),
+                        _rgb(0.60, 1.0, 0.45, 0.0),
+                    ])
+                    path = NSBezierPath.bezierPathWithOvalInRect_(
+                        NSMakeRect(gx - rad, gy - rad, 2 * rad, 2 * rad)
+                    )
+                    grad.drawInBezierPath_relativeCenterPosition_(
+                        path, NSMakePoint(0.0, 0.0)
+                    )
 
         @objc.python_method
         def _draw_marvin_vector(self, c, w, h):
@@ -403,7 +449,9 @@ try:
             self.model = "small"
             self.hover = False
             self.poses = _load_marvin_poses() if style == "marvin" else {}
-            self.clips = _load_marvin_clips() if style == "marvin" else {}
+            self.clips, self.clip_eyes = (
+                _load_marvin_clips() if style == "marvin" else ({}, {})
+            )
             self.levels = [0.0] * _BARS
             self._phase = 0.0
             self._anim = 0.0
@@ -551,12 +599,17 @@ try:
                 self._clip_dir = 1
             self._render()
 
-        def _active_clip(self, mode):
+        def _active_clip_name(self, mode):
             if mode == "recording":
-                return self.clips.get(self._rec_clip) or self.clips.get("shake")
+                return self._rec_clip if self._rec_clip in self.clips else (
+                    "shake" if "shake" in self.clips else None)
             if mode == "transcribing":
-                return self.clips.get("spin")  # played once ready
+                return "spin" if "spin" in self.clips else None
             return None
+
+        def _active_clip(self, mode):
+            name = self._active_clip_name(mode)
+            return self.clips.get(name) if name else None
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
                     style="waveform"):
