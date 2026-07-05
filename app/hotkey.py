@@ -103,10 +103,58 @@ class PushToTalkApp:
         self._busy = threading.Lock()
         self._pressed = set()  # currently-held keys, maintained by the listener
         self._on_status = on_status  # callable(state: str), e.g. menu-bar icon
+        self._active = False           # currently recording
+        self._trigger_vk = None        # set by build_listener
+        self._rec_start = 0.0
+        self._state_lock = threading.Lock()
+        self._max_seconds = 120.0      # hard cap so it can never record forever
+        threading.Thread(target=self._watchdog, daemon=True).start()
 
     def _status(self, state):
         if self._on_status is not None:
             self._on_status(state)
+
+    def _start_recording(self):
+        with self._state_lock:
+            if self._active:
+                return
+            self._active = True
+            self._rec_start = time.monotonic()
+        self.on_press()
+
+    def _stop_recording(self, reason=""):
+        with self._state_lock:
+            if not self._active:
+                return
+            self._active = False
+        if reason:
+            print(f"[rec] stop ({reason})", flush=True)
+        threading.Thread(target=self.on_release, daemon=True).start()
+
+    def _watchdog(self):
+        """Safety net: force-stop if the key is physically up but we missed the
+        release event (macOS can disable the event tap under load), or if a
+        recording runs past the hard cap. Uses the real HID key state, so it
+        does not depend on the (possibly dead) event tap.
+        """
+        while True:
+            time.sleep(0.15)
+            if not self._active:
+                continue
+            try:
+                import Quartz
+
+                if self._trigger_vk is not None:
+                    down = Quartz.CGEventSourceKeyState(
+                        Quartz.kCGEventSourceStateHIDSystemState, self._trigger_vk
+                    )
+                    if not down:
+                        self._stop_recording("watchdog: key released")
+                        continue
+            except Exception:
+                pass
+            if time.monotonic() - self._rec_start > self._max_seconds:
+                self._stop_recording("watchdog: max duration")
 
     def set_model(self, model_name):
         """Swap the STT model at runtime (loads lazily on next dictation)."""
@@ -170,19 +218,8 @@ class PushToTalkApp:
         binding = self.config["hotkey"]["push_to_talk"]
         required = parse_hotkey(binding)
         modifiers, trigger_vk = split_combo(required)
+        self._trigger_vk = trigger_vk  # let the watchdog check physical key state
         pressed = self._pressed  # shared with _wait_hotkey_released
-        active = False
-
-        def start():
-            nonlocal active
-            active = True
-            self.on_press()
-
-        def stop():
-            nonlocal active
-            active = False
-            # Off the listener thread so slow STT never delays key events.
-            threading.Thread(target=self.on_release, daemon=True).start()
 
         def intercept(event_type, event):
             """Swallow the trigger key at the event tap so the focused app
@@ -198,14 +235,14 @@ class PushToTalkApp:
             if vk != trigger_vk:
                 return event
             if event_type == Quartz.kCGEventKeyDown:
-                if active:
+                if self._active:
                     return None  # key-repeat while recording: just swallow
                 if modifiers <= pressed:
-                    start()
+                    self._start_recording()
                     return None
                 return event  # trigger key without the modifiers: normal typing
-            if active:  # kCGEventKeyUp ending the dictation
-                stop()
+            if self._active:  # kCGEventKeyUp ending the dictation
+                self._stop_recording()
                 return None
             return event
 
@@ -213,15 +250,15 @@ class PushToTalkApp:
             pressed.add(canonicalize(key))
             # Fallback activation when suppression is unavailable (multi-key
             # or unresolvable trigger): behave as a plain observer combo.
-            if trigger_vk is None and not active and required <= pressed:
-                start()
+            if trigger_vk is None and not self._active and required <= pressed:
+                self._start_recording()
 
         def on_release(key):
             k = canonicalize(key)
             pressed.discard(k)
             # Releasing a modifier first also ends the dictation.
-            if active and k in required:
-                stop()
+            if self._active and k in required:
+                self._stop_recording()
 
         print(f"Ready. Hold [{binding}] to dictate.", flush=True)
         print("(If nothing happens, grant Input Monitoring and Accessibility "
