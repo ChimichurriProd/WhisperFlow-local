@@ -111,6 +111,7 @@ class PushToTalkApp:
         self._rec_start = 0.0
         self._state_lock = threading.Lock()
         self._max_seconds = 120.0      # hard cap so it can never record forever
+        self._event_tap = None         # pynput's CGEventTap, captured for re-enable
         threading.Thread(target=self._watchdog, daemon=True).start()
 
     def _status(self, state):
@@ -135,29 +136,35 @@ class PushToTalkApp:
         threading.Thread(target=self.on_release, daemon=True).start()
 
     def _watchdog(self):
-        """Safety net: force-stop if the key is physically up but we missed the
-        release event (macOS can disable the event tap under load), or if a
-        recording runs past the hard cap. Uses the real HID key state, so it
-        does not depend on the (possibly dead) event tap.
+        """Safety net, twice over:
+
+        1. Keep the keyboard event tap alive. macOS disables the tap under load
+           (e.g. during a heavy transcription) and pynput never re-enables it,
+           which silently kills the hotkey until restart. We re-enable it.
+        2. Force-stop a recording if the key is physically up but we missed the
+           release event, or if it runs past the hard cap — using the real HID
+           key state, independent of the (possibly disabled) tap.
         """
         while True:
             time.sleep(0.15)
-            if not self._active:
-                continue
             try:
                 import Quartz
 
-                if self._trigger_vk is not None:
-                    down = Quartz.CGEventSourceKeyState(
+                tap = self._event_tap
+                if tap is not None and not Quartz.CGEventTapIsEnabled(tap):
+                    Quartz.CGEventTapEnable(tap, True)
+                    print("[hotkey] event tap was disabled — re-enabled", flush=True)
+
+                if self._active:
+                    if self._trigger_vk is not None and not Quartz.CGEventSourceKeyState(
                         Quartz.kCGEventSourceStateHIDSystemState, self._trigger_vk
-                    )
-                    if not down:
+                    ):
                         self._stop_recording("watchdog: key released")
                         continue
+                    if time.monotonic() - self._rec_start > self._max_seconds:
+                        self._stop_recording("watchdog: max duration")
             except Exception:
                 pass
-            if time.monotonic() - self._rec_start > self._max_seconds:
-                self._stop_recording("watchdog: max duration")
 
     def _rebuild_transcriber(self):
         self.transcriber = Transcriber(
@@ -292,11 +299,22 @@ class PushToTalkApp:
         if trigger_vk is None:
             print("note: hotkey suppression unavailable for this combo; the "
                   "focused app may also see the keystrokes.", flush=True)
-        return keyboard.Listener(
+        listener = keyboard.Listener(
             on_press=on_press,
             on_release=on_release,
             darwin_intercept=intercept,
         )
+        # Capture the CGEventTap pynput creates so the watchdog can re-enable it
+        # if macOS disables it under load (pynput itself never does).
+        orig_create = listener._create_event_tap
+
+        def _capture_tap():
+            tap = orig_create()
+            self._event_tap = tap
+            return tap
+
+        listener._create_event_tap = _capture_tap
+        return listener
 
     def run(self):
         """Blocking CLI mode: run the listener until Ctrl+C."""
