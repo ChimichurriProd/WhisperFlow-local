@@ -254,18 +254,38 @@ try:
                 )
                 grad.drawInBezierPath_angle_(bar, 90.0)
 
+        # eye centroids in the head image (normalized, y from top)
+        _EYES = ((0.246, 0.629), (0.744, 0.632))
+
         @objc.python_method
         def _draw_marvin(self, c, w, h):
-            """Marvin the Paranoid Android: a glum round face whose mouth opens
-            with your voice. Uses image frames if provided, else draws vectors."""
+            """Marvin: the head image, with eyes that glow/flicker with voice."""
             frames = c.frames
             if frames:
+                frames[0].drawInRect_(NSMakeRect(0, 0, w, h))
                 level = c.levels[-1] if c.levels else 0.0
-                openness = level if c.mode in ("recording", "transcribing") else 0.0
-                idx = min(len(frames) - 1, int(openness * len(frames) + 1e-6))
-                frames[idx].drawInRect_(NSMakeRect(0, 0, w, h))
+                glow = level if c.mode in ("recording", "transcribing") else 0.0
+                if glow > 0.04:
+                    self._eye_glow(w, h, glow)
                 return
             self._draw_marvin_vector(c, w, h)
+
+        @objc.python_method
+        def _eye_glow(self, w, h, glow):
+            """Additive green bloom over each eye, intensity = loudness."""
+            for nx, ny in self._EYES:
+                gx, gy = nx * w, ny * h
+                rad = w * 0.15 * (1.0 + glow * 0.5)
+                grad = NSGradient.alloc().initWithColors_([
+                    _rgb(0.55, 1.0, 0.40, min(0.75, glow * 0.85)),
+                    _rgb(0.55, 1.0, 0.40, 0.0),
+                ])
+                path = NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect(gx - rad, gy - rad, 2 * rad, 2 * rad)
+                )
+                grad.drawInBezierPath_relativeCenterPosition_(
+                    path, NSMakePoint(0.0, 0.0)
+                )
 
         @objc.python_method
         def _draw_marvin_vector(self, c, w, h):
