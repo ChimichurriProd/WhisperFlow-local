@@ -124,8 +124,10 @@ class MenuBarApp(rumps.App):
         # blocked/paused show as the idle dot (no active waveform).
         pill_mode = "idle" if mode in ("idle", "blocked", "paused") else mode
         level = self.engine.recorder.level if pill_mode == "recording" else 0.0
-        # Idle costs nothing once the waveform has settled (skip unless hovered).
-        if (pill_mode == "idle" and not self.pill.hover
+        # Waveform idle costs nothing once settled; Marvin keeps a subtle idle
+        # bob so he always looks a little alive.
+        if (pill_mode == "idle" and self.pill.style != "marvin"
+                and not self.pill.hover
                 and not any(v > 0.001 for v in self.pill.levels)):
             return
         self.pill.tick(pill_mode, level)

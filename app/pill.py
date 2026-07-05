@@ -25,10 +25,12 @@ _MARVIN_SIZE = 64.0  # the round Marvin face is a fixed square
 
 try:
     from AppKit import (
+        NSAffineTransform,
         NSAnimationContext,
         NSBackingStoreBuffered,
         NSBezierPath,
         NSColor,
+        NSGraphicsContext,
         NSEvent,
         NSFont,
         NSFontAttributeName,
@@ -200,7 +202,15 @@ try:
             h = self.frame().size.height
 
             if c.style == "marvin":
+                NSGraphicsContext.saveGraphicsState()
+                if abs(c.tilt) > 0.05:  # rotate the head around its centre
+                    t = NSAffineTransform.transform()
+                    t.translateXBy_yBy_(w / 2.0, h / 2.0)
+                    t.rotateByDegrees_(c.tilt)
+                    t.translateXBy_yBy_(-w / 2.0, -h / 2.0)
+                    t.concat()
                 self._draw_marvin(c, w, h)
+                NSGraphicsContext.restoreGraphicsState()
                 return
 
             # subtle dark tint over the frosted glass for contrast + a hairline
@@ -262,7 +272,6 @@ try:
             cx, cy = w / 2.0, h / 2.0
             R = min(w, h) / 2.0 - 3.0
             dark = (0.13, 0.13, 0.16)
-            green = (0.49, 0.83, 0.13)
 
             # head
             face = NSBezierPath.bezierPathWithOvalInRect_(
@@ -284,43 +293,48 @@ try:
             _rgb(*dark).setStroke()
             brow.stroke()
 
-            # two big downward green triangle eyes hanging from the brow
+            # two big downward green triangle eyes that glow/flicker with voice
+            level = c.levels[-1] if c.levels else 0.0
+            glow = level if c.mode in ("recording", "transcribing") else 0.0
             ew, eh = R * 0.42, R * 0.60
             for ex in (cx - R * 0.36, cx + R * 0.36):
+                # soft green bloom behind the eye, intensity = loudness
+                if glow > 0.04:
+                    s = 1.0 + glow * 0.8
+                    bloom = NSBezierPath.bezierPath()
+                    bloom.moveToPoint_(NSMakePoint(ex - ew * s / 2, brow_y + 1))
+                    bloom.lineToPoint_(NSMakePoint(ex + ew * s / 2, brow_y + 1))
+                    bloom.lineToPoint_(NSMakePoint(ex, brow_y + eh * s))
+                    bloom.closePath()
+                    _rgb(0.55, 1.0, 0.35, min(0.6, glow * 0.7)).setFill()
+                    bloom.fill()
                 tri = NSBezierPath.bezierPath()
                 tri.moveToPoint_(NSMakePoint(ex - ew / 2, brow_y + 1))
                 tri.lineToPoint_(NSMakePoint(ex + ew / 2, brow_y + 1))
                 tri.lineToPoint_(NSMakePoint(ex, brow_y + eh))
                 tri.closePath()
-                _rgb(*green).setFill()
+                # brighter green as it speaks
+                g = (min(0.65, 0.49 + glow * 0.3), min(1.0, 0.83 + glow * 0.15),
+                     0.13 + glow * 0.2)
+                _rgb(*g).setFill()
                 tri.fill()
                 _rgb(*dark).setStroke()
                 tri.setLineWidth_(1.5)
                 tri.stroke()
 
-            # mouth: a glum closed curve when idle; opens with voice when talking
-            level = c.levels[-1] if c.levels else 0.0
-            openness = level if c.mode in ("recording", "transcribing") else 0.0
+            # no mouth: he "speaks" with his eyes (the glow above). Just a faint
+            # glum resting curve for character.
             my = cy + R * 0.66
-            if openness < 0.06:
-                mouth = NSBezierPath.bezierPath()
-                mouth.moveToPoint_(NSMakePoint(cx - R * 0.34, my))
-                mouth.curveToPoint_controlPoint1_controlPoint2_(
-                    NSMakePoint(cx + R * 0.34, my),
-                    NSMakePoint(cx - R * 0.12, my + R * 0.14),
-                    NSMakePoint(cx + R * 0.12, my + R * 0.14),
-                )
-                mouth.setLineWidth_(max(1.8, R * 0.045))
-                _rgb(*dark).setStroke()
-                mouth.stroke()
-            else:
-                mw = R * 0.62
-                mh = R * 0.10 + min(1.0, openness) * R * 0.28  # wider than tall
-                oval = NSBezierPath.bezierPathWithOvalInRect_(
-                    NSMakeRect(cx - mw / 2, my - mh / 2, mw, mh)
-                )
-                _rgb(0.10, 0.10, 0.12, 1.0).setFill()
-                oval.fill()
+            mouth = NSBezierPath.bezierPath()
+            mouth.moveToPoint_(NSMakePoint(cx - R * 0.30, my))
+            mouth.curveToPoint_controlPoint1_controlPoint2_(
+                NSMakePoint(cx + R * 0.30, my),
+                NSMakePoint(cx - R * 0.10, my + R * 0.12),
+                NSMakePoint(cx + R * 0.10, my + R * 0.12),
+            )
+            mouth.setLineWidth_(max(1.6, R * 0.04))
+            _rgb(0.13, 0.13, 0.16, 0.5).setStroke()
+            mouth.stroke()
 
         @objc.python_method
         def _glow_dot(self, cx, cy, radius, rgb):
@@ -364,6 +378,8 @@ try:
             self.frames = _load_marvin_frames() if style == "marvin" else []
             self.levels = [0.0] * _BARS
             self._phase = 0.0
+            self._anim = 0.0
+            self.tilt = 0.0  # head-tilt degrees (marvin style)
             self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
             self._w = _MARVIN_SIZE if style == "marvin" else _WIDTH_IDLE
 
@@ -462,6 +478,15 @@ try:
             else:
                 if any(v > 0.001 for v in self.levels):
                     self.levels = [v * 0.6 for v in self.levels]
+
+            # head-tilt animation (marvin): gentle "listening" sway while
+            # dictating, a barely-there bob when idle. Eased for smoothness.
+            self._anim += 0.05
+            if mode in ("recording", "transcribing"):
+                target = 9.0 * math.sin(self._anim * 2.2)  # attentive sway
+            else:
+                target = 2.0 * math.sin(self._anim * 0.9)  # subtle idle life
+            self.tilt += (target - self.tilt) * 0.25
             self._render()
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
