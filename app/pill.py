@@ -34,6 +34,7 @@ try:
         NSFontAttributeName,
         NSForegroundColorAttributeName,
         NSGradient,
+        NSImage,
         NSEventModifierFlagControl,
         NSMakePoint,
         NSMakeRect,
@@ -86,6 +87,24 @@ try:
 
     def _hover_label(model):
         return f"Model: {model}"
+
+    def _load_marvin_frames():
+        """Load assets/marvin/*.png sorted (closed -> open) as NSImages.
+
+        If present, the pill lip-syncs these frames to your voice; if the
+        folder is empty/missing, it falls back to the drawn vector face.
+        """
+        from pathlib import Path
+
+        d = Path(__file__).resolve().parent.parent / "assets" / "marvin"
+        if not d.is_dir():
+            return []
+        frames = []
+        for f in sorted(d.glob("*.png")):
+            img = NSImage.alloc().initWithContentsOfFile_(str(f))
+            if img is not None:
+                frames.append(img)
+        return frames
 
     def _screen_with_mouse():
         p = NSEvent.mouseLocation()
@@ -228,7 +247,18 @@ try:
         @objc.python_method
         def _draw_marvin(self, c, w, h):
             """Marvin the Paranoid Android: a glum round face whose mouth opens
-            with your voice while dictating."""
+            with your voice. Uses image frames if provided, else draws vectors."""
+            frames = c.frames
+            if frames:
+                level = c.levels[-1] if c.levels else 0.0
+                openness = level if c.mode in ("recording", "transcribing") else 0.0
+                idx = min(len(frames) - 1, int(openness * len(frames) + 1e-6))
+                frames[idx].drawInRect_(NSMakeRect(0, 0, w, h))
+                return
+            self._draw_marvin_vector(c, w, h)
+
+        @objc.python_method
+        def _draw_marvin_vector(self, c, w, h):
             cx, cy = w / 2.0, h / 2.0
             R = min(w, h) / 2.0 - 3.0
             dark = (0.13, 0.13, 0.16)
@@ -331,6 +361,7 @@ try:
             self.mode = "idle"
             self.model = "small"
             self.hover = False
+            self.frames = _load_marvin_frames() if style == "marvin" else []
             self.levels = [0.0] * _BARS
             self._phase = 0.0
             self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
