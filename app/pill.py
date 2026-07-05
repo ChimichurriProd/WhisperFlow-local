@@ -20,7 +20,8 @@ _HEIGHT = 32.0
 _WIDTH_IDLE = 32.0  # equals height => a round dot when idle
 _WIDTH_REC = 250.0  # hover width is measured from the label (see _target_width)
 _BARS = 24
-_MARVIN_SIZE = 64.0  # the round Marvin face is a fixed square
+_MARVIN_SIZE = 80.0   # window; the head is drawn inset so it can nod/tilt freely
+_MARVIN_INSET = 0.10  # fraction of margin around the head for movement room
 
 
 try:
@@ -259,30 +260,34 @@ try:
 
         @objc.python_method
         def _draw_marvin(self, c, w, h):
-            """Marvin: the head image, with eyes that glow/flicker with voice."""
+            """Marvin: the head image (inset so it can move without clipping),
+            with eyes that glow/flicker with voice."""
             frames = c.frames
             if frames:
-                frames[0].drawInRect_(NSMakeRect(0, 0, w, h))
+                m = w * _MARVIN_INSET
+                rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
+                frames[0].drawInRect_(NSMakeRect(rx, ry, rw, rh))
                 level = c.levels[-1] if c.levels else 0.0
                 glow = level if c.mode in ("recording", "transcribing") else 0.0
                 if glow > 0.04:
-                    self._eye_glow(w, h, glow)
+                    self._eye_glow(rx, ry, rw, rh, glow)
                 return
             self._draw_marvin_vector(c, w, h)
 
         @objc.python_method
-        def _eye_glow(self, w, h, glow):
+        def _eye_glow(self, rx, ry, rw, rh, glow):
             """Soft, feathered green bloom over BOTH eyes, intensity = loudness.
 
             Three stacked radial gradients (core -> soft -> wide halo) so it
-            fades out gradually instead of looking like a hard disc.
+            fades out gradually instead of looking like a hard disc. Positions
+            are relative to the (inset) head rect.
             """
             core = min(0.6, glow * 0.8)
             for nx, ny in self._EYES:
-                gx, gy = nx * w, ny * h
+                gx, gy = rx + nx * rw, ry + ny * rh
                 for scale, alpha in ((0.11, core), (0.20, core * 0.55),
                                      (0.34, core * 0.28)):
-                    rad = w * scale * (1.0 + glow * 0.4)
+                    rad = rw * scale * (1.0 + glow * 0.4)
                     grad = NSGradient.alloc().initWithColors_([
                         _rgb(0.55, 1.0, 0.42, alpha),
                         _rgb(0.55, 1.0, 0.42, 0.0),
