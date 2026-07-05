@@ -411,6 +411,8 @@ try:
             self.nod = 0.0   # vertical nod offset px (vector fallback only)
             self._clip_f = 0.0   # current flipbook frame (float, ping-ponged)
             self._clip_dir = 1
+            self._rec_clip = "shake"   # alternates shake/nod each dictation
+            self._prev_mode = "idle"
             self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
             self._w = _MARVIN_SIZE if style == "marvin" else _WIDTH_IDLE
 
@@ -524,7 +526,15 @@ try:
             self.tilt += (target - self.tilt) * 0.25
             self.nod += (nod_target - self.nod) * 0.25
 
-            # Flipbook clip: play the shake while dictating (ping-pong so it
+            # On each new dictation, alternate which gesture he does.
+            if mode == "recording" and self._prev_mode != "recording":
+                order = [n for n in ("shake", "nod") if n in self.clips]
+                if order:
+                    cur = self._rec_clip if self._rec_clip in order else order[0]
+                    self._rec_clip = order[(order.index(cur) + 1) % len(order)]
+            self._prev_mode = mode
+
+            # Flipbook clip: play the gesture while dictating (ping-pong so it
             # loops seamlessly); hold still on the centre frame when idle.
             clip = self._active_clip(mode)
             if clip:
@@ -543,7 +553,7 @@ try:
 
         def _active_clip(self, mode):
             if mode == "recording":
-                return self.clips.get("shake")
+                return self.clips.get(self._rec_clip) or self.clips.get("shake")
             if mode == "transcribing":
                 return self.clips.get("spin")  # played once ready
             return None
