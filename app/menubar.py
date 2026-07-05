@@ -58,8 +58,10 @@ class MenuBarApp(rumps.App):
             self.model_menu.add(item)
         self._mark_current_model()
 
-        self.menu = [self.status_item, self.model_menu, self.perms_item,
-                     self.pause_item, None,
+        self.settings_menu = self._build_settings_menu()
+
+        self.menu = [self.status_item, self.model_menu, self.settings_menu,
+                     self.perms_item, self.pause_item, None,
                      rumps.MenuItem("Quit", callback=rumps.quit_application)]
 
         self.engine = PushToTalkApp(config, on_status=self.set_state)
@@ -110,6 +112,58 @@ class MenuBarApp(rumps.App):
 
     def _save_pill_pos(self, x, y):
         self.config["pill"] = {"x": x, "y": y}
+        self._save_config()
+
+    # -------------------------------------------------------------- settings
+
+    _LANGUAGES = [("Auto-detect", None), ("Svenska", "sv"), ("English", "en")]
+
+    def _build_settings_menu(self):
+        menu = rumps.MenuItem("Settings")
+
+        lang_menu = rumps.MenuItem("Language")
+        self._lang_items = {}
+        current_lang = self.config["stt"].get("language")
+        for label, code in self._LANGUAGES:
+            it = rumps.MenuItem(label, callback=self._make_lang_cb(code))
+            it.state = 1 if code == current_lang else 0
+            self._lang_items[code] = it
+            lang_menu.add(it)
+        menu.add(lang_menu)
+
+        self._cleanup_item = rumps.MenuItem(
+            "AI cleanup", callback=self._toggle_cleanup
+        )
+        self._cleanup_item.state = 1 if self.config["cleanup"].get("enabled", True) else 0
+        menu.add(self._cleanup_item)
+
+        self._sound_item = rumps.MenuItem(
+            "Sound cues", callback=self._toggle_sound
+        )
+        self._sound_item.state = 1 if self.config.get("sound_cues", {}).get("enabled", True) else 0
+        menu.add(self._sound_item)
+        return menu
+
+    def _make_lang_cb(self, code):
+        return lambda _sender: self._select_language(code)
+
+    def _select_language(self, code):
+        self.engine.set_language(code)
+        for c, item in self._lang_items.items():
+            item.state = 1 if c == code else 0
+        self._save_config()
+
+    def _toggle_cleanup(self, sender):
+        new = not self.config["cleanup"].get("enabled", True)
+        self.config["cleanup"]["enabled"] = new
+        sender.state = 1 if new else 0
+        self._save_config()
+
+    def _toggle_sound(self, sender):
+        cues = self.config.setdefault("sound_cues", {})
+        new = not cues.get("enabled", True)
+        cues["enabled"] = new
+        sender.state = 1 if new else 0
         self._save_config()
 
     # ---------------------------------------------------------------- model

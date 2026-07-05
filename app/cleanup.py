@@ -21,11 +21,16 @@ _FILLER_RE = re.compile(
 )
 
 CLEANUP_PROMPT = (
-    "You clean up dictated text. Remove filler words and false starts, fix "
-    "capitalization and punctuation, and preserve the speaker's meaning and "
-    "wording. Keep the text in its original language — Swedish stays Swedish, "
-    "English stays English; never translate. Output ONLY the cleaned text "
-    "with no commentary.\n\n"
+    "You are a transcription cleaner. Your ONLY job is light copy-editing of "
+    "dictated text. Strict rules:\n"
+    "- Remove filler words (um, uh, öh, asså, you know) and false starts.\n"
+    "- Fix capitalization, punctuation, and obvious spacing only.\n"
+    "- KEEP every other word exactly as spoken. Do NOT rephrase, summarize, "
+    "shorten, expand, reorder, translate, or change the meaning.\n"
+    "- Keep the original language (Swedish stays Swedish, English stays "
+    "English).\n"
+    "- If unsure, leave the text unchanged.\n"
+    "Output ONLY the cleaned text — no quotes, no commentary, no preamble.\n\n"
     "Dictated text:\n{text}"
 )
 
@@ -71,6 +76,8 @@ def ollama_clean(text, ollama_url, ollama_model, timeout=30, keep_alive="30m"):
             "prompt": CLEANUP_PROMPT.format(text=text),
             "stream": False,
             "keep_alive": keep_alive,
+            # temperature 0 = deterministic + faithful (no creative rewrites)
+            "options": {"temperature": 0.0},
         },
         timeout=timeout,
     )
@@ -85,6 +92,12 @@ def clean_transcript(text, config):
         return ""
 
     cfg = config["cleanup"]
+    fixes = config.get("vocabulary", {}).get("fixes", {})
+
+    if not cfg.get("enabled", True):
+        # Verbatim mode: exactly what was said, only forced vocab corrections.
+        return apply_vocabulary_fixes(text, fixes)
+
     word_count = len(text.split())
 
     if word_count < cfg["skip_llm_under_words"]:
@@ -104,5 +117,4 @@ def clean_transcript(text, config):
             result = strip_fillers(text)
 
     # Custom-vocabulary corrections win over whatever STT/LLM produced.
-    fixes = config.get("vocabulary", {}).get("fixes", {})
     return apply_vocabulary_fixes(result, fixes)

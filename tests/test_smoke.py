@@ -79,6 +79,48 @@ def test_build_initial_prompt():
     assert "Ollama" in p and "WhisperFlow" in p
 
 
+def test_cleanup_disabled_is_verbatim(config):
+    config["cleanup"]["enabled"] = False
+    config["vocabulary"] = {"terms": [], "fixes": {"olama": "Ollama"}}
+    raw = "um i use olama and it stays exactly like this"
+    with patch.object(cleanup, "ollama_clean") as mock_llm:
+        result = cleanup.clean_transcript(raw, config)
+    mock_llm.assert_not_called()
+    assert result == "um i use Ollama and it stays exactly like this"  # verbatim + fix
+
+
+def test_ollama_clean_sends_temperature_zero(config):
+    import app.cleanup as cl
+
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "ok"}
+
+    def fake_post(url, json=None, timeout=None):
+        captured.update(json)
+        return FakeResp()
+
+    with patch.object(cl.requests, "post", side_effect=fake_post):
+        cl.ollama_clean("hello there world", "http://x", "m")
+    assert captured["options"]["temperature"] == 0.0
+
+
+def test_sound_cues_respect_toggle():
+    from app import sound
+
+    with patch.object(sound, "_play") as p:
+        sound.play_start({"sound_cues": {"enabled": False}})
+    p.assert_not_called()
+    with patch.object(sound, "_play") as p:
+        sound.play_start({"sound_cues": {"enabled": True, "start": "Tink"}})
+    p.assert_called_once_with("Tink")
+
+
 def test_ollama_failure_falls_back_to_rules(config):
     text = "um " + " ".join(["word"] * 11)
     with patch.object(

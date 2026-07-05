@@ -18,6 +18,7 @@ import time
 from .audio import Recorder
 from .cleanup import clean_transcript
 from .injection import inject_text
+from .sound import play_done, play_start
 from .stt import Transcriber, build_initial_prompt
 
 
@@ -158,12 +159,20 @@ class PushToTalkApp:
             if time.monotonic() - self._rec_start > self._max_seconds:
                 self._stop_recording("watchdog: max duration")
 
-    def set_model(self, model_name):
-        """Swap the STT model at runtime (loads lazily on next dictation)."""
-        self.config["stt"]["model"] = model_name
+    def _rebuild_transcriber(self):
         self.transcriber = Transcriber(
             **self.config["stt"], initial_prompt=self._initial_prompt
         )
+
+    def set_model(self, model_name):
+        """Swap the STT model at runtime (loads lazily on next dictation)."""
+        self.config["stt"]["model"] = model_name
+        self._rebuild_transcriber()
+
+    def set_language(self, language):
+        """Set forced language (None = auto-detect); rebuilds the transcriber."""
+        self.config["stt"]["language"] = language
+        self._rebuild_transcriber()
 
     def _wait_hotkey_released(self, timeout=1.0):
         """Block until the user lets go of the hotkey keys (or timeout).
@@ -187,6 +196,7 @@ class PushToTalkApp:
             return
         print("[rec] listening...", flush=True)
         self._status("recording")
+        play_start(self.config)
         try:
             self.recorder.start()
         except Exception as exc:
@@ -217,6 +227,7 @@ class PushToTalkApp:
                 if self.config["injection"].get("append_trailing_space", True):
                     to_inject += " "  # keep a gap before the next dictation
                 inject_text(to_inject, self.config)
+                play_done(self.config)
             finally:
                 self._status("idle")
 

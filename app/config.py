@@ -14,6 +14,7 @@ DEFAULTS = {
         "compute_type": "int8",       # faster-whisper only
     },
     "cleanup": {
+        "enabled": True,       # False = verbatim (no AI cleanup)
         "ollama_url": "http://localhost:11434",
         "ollama_model": "llama3.1:8b",
         "skip_llm_under_words": 10,
@@ -40,6 +41,11 @@ DEFAULTS = {
         # 'fixes' force exact corrections after transcription (wrong -> right),
         # whole-word and case-insensitive, for stubborn mishears.
         "fixes": {},
+    },
+    "sound_cues": {
+        "enabled": True,
+        "start": "Tink",  # any name from /System/Library/Sounds
+        "done": "Pop",
     },
 }
 

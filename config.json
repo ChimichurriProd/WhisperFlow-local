@@ -8,6 +8,7 @@
     "compute_type": "int8"
   },
   "cleanup": {
+    "enabled": true,
     "ollama_url": "http://localhost:11434",
     "ollama_model": "llama3.1:8b",
     "skip_llm_under_words": 10,
@@ -31,5 +32,10 @@
   "vocabulary": {
     "terms": ["Ollama", "WhisperFlow", "faster-whisper", "CTranslate2"],
     "fixes": {}
+  },
+  "sound_cues": {
+    "enabled": true,
+    "start": "Tink",
+    "done": "Pop"
   }
 }
