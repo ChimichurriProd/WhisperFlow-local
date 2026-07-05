@@ -20,8 +20,8 @@ _HEIGHT = 32.0
 _WIDTH_IDLE = 32.0  # equals height => a round dot when idle
 _WIDTH_REC = 250.0  # hover width is measured from the label (see _target_width)
 _BARS = 24
-_MARVIN_SIZE = 80.0   # window; the head is drawn inset so it can nod/tilt freely
-_MARVIN_INSET = 0.10  # fraction of margin around the head for movement room
+_MARVIN_SIZE = 100.0  # window (larger than the head so the eye-glow has room)
+_MARVIN_INSET = 0.18  # head is ~64px inside the window; margin holds the glow
 
 
 try:
@@ -278,21 +278,10 @@ try:
             rect = NSMakeRect(rx, ry, rw, rh)
             zero = NSMakeRect(0, 0, 0, 0)
 
-            center = c.poses["center"]
-            gdir = c._glance_dir
-            glance = c.poses.get(gdir) if gdir else None
-            # fast-in / hold / fast-out: the glance pose is drawn fully opaque
-            # during the hold (no ghosting); only the brief ramps overlap.
-            if glance is not None:
-                t = c._glance_t
-                if t < 0.22:
-                    b = t / 0.22
-                elif t > 0.78:
-                    b = (1.0 - t) / 0.22
-                else:
-                    b = 1.0
-            else:
-                b = 0.0
+            # HARD CUT (cartoon): show exactly one pose — center, or the glance
+            # pose while a glance is active. No blending, no ghosting.
+            gdir = c._glance_dir if c._glance_dir in c.poses else None
+            img = c.poses[gdir] if gdir else c.poses["center"]
 
             # The fraction/alpha draw API renders upside-down in a flipped view,
             # so flip the context back around the head rect before drawing.
@@ -301,17 +290,20 @@ try:
             flip.translateXBy_yBy_(0.0, 2 * ry + rh)
             flip.scaleXBy_yBy_(1.0, -1.0)
             flip.concat()
-            center.drawInRect_fromRect_operation_fraction_(rect, zero, 2, 1.0)
-            if b > 0.001 and glance is not None:
-                glance.drawInRect_fromRect_operation_fraction_(rect, zero, 2, b)
+            img.drawInRect_fromRect_operation_fraction_(rect, zero, 2, 1.0)
             NSGraphicsContext.restoreGraphicsState()
 
             level = c.levels[-1] if c.levels else 0.0
             glow = level if c.mode in ("recording", "transcribing") else 0.0
             if glow > 0.04:
-                dom = gdir if (glance is not None and b >= 0.6) else "center"
-                eyes = _POSE_EYES.get(dom, _POSE_EYES["center"])
+                eyes = _POSE_EYES.get(gdir or "center", _POSE_EYES["center"])
+                # clip the bloom to a circle so it never shows a square edge
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect(w * 0.02, h * 0.02, w * 0.96, h * 0.96)
+                ).addClip()
                 self._eye_glow(rx, ry, rw, rh, eyes, glow)
+                NSGraphicsContext.restoreGraphicsState()
 
         @objc.python_method
         def _eye_glow(self, rx, ry, rw, rh, eyes, glow):
