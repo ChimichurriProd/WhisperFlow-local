@@ -23,6 +23,7 @@ DEFAULTS = {
     },
     "hotkey": {
         "push_to_talk": "control + shift + space",
+        "mode": "hold",  # "hold" = push-to-talk | "toggle" = tap on/off
     },
     "injection": {
         "delivery_method": "clipboard",  # "clipboard" | "type"

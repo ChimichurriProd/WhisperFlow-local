@@ -112,7 +112,23 @@ class PushToTalkApp:
         self._state_lock = threading.Lock()
         self._max_seconds = 120.0      # hard cap so it can never record forever
         self._event_tap = None         # pynput's CGEventTap, captured for re-enable
+        self._toggle = config["hotkey"].get("mode", "hold") == "toggle"
         threading.Thread(target=self._watchdog, daemon=True).start()
+
+    def set_toggle_mode(self, toggle):
+        """Switch between hold-to-talk and tap-to-toggle. If we're mid-recording
+        when switching, stop cleanly."""
+        self._toggle = bool(toggle)
+        self.config["hotkey"]["mode"] = "toggle" if toggle else "hold"
+        if self._active:
+            self._stop_recording("mode changed")
+
+    def reload_vocabulary(self):
+        """Rebuild the STT bias prompt from the current config vocabulary."""
+        self._initial_prompt = build_initial_prompt(
+            self.config.get("vocabulary", {}).get("terms", [])
+        )
+        self._rebuild_transcriber()
 
     def _status(self, state):
         if self._on_status is not None:
@@ -156,9 +172,13 @@ class PushToTalkApp:
                     print("[hotkey] event tap was disabled — re-enabled", flush=True)
 
                 if self._active:
-                    if self._trigger_vk is not None and not Quartz.CGEventSourceKeyState(
-                        Quartz.kCGEventSourceStateHIDSystemState, self._trigger_vk
-                    ):
+                    # In hold mode, a physically-released key means the release
+                    # event was missed — stop. In toggle mode the key is up on
+                    # purpose while recording, so skip this check.
+                    if (not self._toggle and self._trigger_vk is not None
+                            and not Quartz.CGEventSourceKeyState(
+                                Quartz.kCGEventSourceStateHIDSystemState,
+                                self._trigger_vk)):
                         self._stop_recording("watchdog: key released")
                         continue
                     if time.monotonic() - self._rec_start > self._max_seconds:
@@ -268,13 +288,23 @@ class PushToTalkApp:
             if vk != trigger_vk:
                 return event
             if event_type == Quartz.kCGEventKeyDown:
+                if self._toggle:
+                    if self._active:
+                        self._stop_recording()   # tap again -> stop
+                        return None
+                    if modifiers <= pressed:
+                        self._start_recording()  # tap -> start
+                        return None
+                    return event
+                # hold mode
                 if self._active:
                     return None  # key-repeat while recording: just swallow
                 if modifiers <= pressed:
                     self._start_recording()
                     return None
                 return event  # trigger key without the modifiers: normal typing
-            if self._active:  # kCGEventKeyUp ending the dictation
+            # kCGEventKeyUp
+            if not self._toggle and self._active:  # hold: release ends it
                 self._stop_recording()
                 return None
             return event
@@ -283,14 +313,18 @@ class PushToTalkApp:
             pressed.add(canonicalize(key))
             # Fallback activation when suppression is unavailable (multi-key
             # or unresolvable trigger): behave as a plain observer combo.
-            if trigger_vk is None and not self._active and required <= pressed:
-                self._start_recording()
+            if trigger_vk is None and required <= pressed:
+                if self._toggle:
+                    (self._stop_recording if self._active
+                     else self._start_recording)()
+                elif not self._active:
+                    self._start_recording()
 
         def on_release(key):
             k = canonicalize(key)
             pressed.discard(k)
-            # Releasing a modifier first also ends the dictation.
-            if self._active and k in required:
+            # Hold mode: releasing a modifier first also ends the dictation.
+            if not self._toggle and self._active and k in required:
                 self._stop_recording()
 
         print(f"Ready. Hold [{binding}] to dictate.", flush=True)

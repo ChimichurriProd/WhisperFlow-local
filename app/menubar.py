@@ -147,6 +147,17 @@ class MenuBarApp(rumps.App):
     _LANGUAGES = [("Auto-detect", None), ("Svenska", "sv"),
                   ("English", "en"), ("Español", "es")]
 
+    _HOTKEYS = [
+        ("control + shift + space", "Control + Shift + Space"),
+        ("command + shift + space", "Command + Shift + Space"),
+        ("control + option + space", "Control + Option + Space"),
+        ("f9", "F9"),
+        ("f13", "F13"),
+    ]
+
+    _SOUND_NAMES = ["Tink", "Pop", "Glass", "Ping", "Bottle", "Frog",
+                    "Funk", "Hero", "Morse", "Purr", "Sosumi", "Submarine"]
+
     def _build_settings_menu(self):
         menu = rumps.MenuItem("Settings")
 
@@ -201,6 +212,65 @@ class MenuBarApp(rumps.App):
     def _toggle_sound(self, _sender):
         self._apply_sound(not self.config.get("sound_cues", {}).get("enabled", True))
 
+    # -------- input mode / hotkey / vocabulary / sound pack ----------------
+
+    def _apply_input_mode(self, toggle):
+        self.engine.set_toggle_mode(toggle)
+        self._save_config()
+
+    def _rebuild_listener(self):
+        if self.listener is None:
+            return  # paused — new binding applies on resume
+        try:
+            self.listener.stop()
+        except Exception:
+            pass
+        self.listener = self.engine.build_listener()
+        self.listener.start()
+
+    def _apply_hotkey(self, binding):
+        self.config["hotkey"]["push_to_talk"] = binding
+        self._save_config()
+        self._rebuild_listener()
+
+    def _add_vocab_word(self):
+        resp = rumps.Window(
+            message="Add a word or name Marvin should always transcribe "
+                    "correctly:",
+            title="Vocabulary", default_text="", ok="Add", cancel="Cancel",
+            dimensions=(320, 22),
+        ).run()
+        term = resp.text.strip()
+        if resp.clicked and term:
+            self.config.setdefault("vocabulary", {}).setdefault(
+                "terms", []).append(term)
+            self.engine.reload_vocabulary()
+            self._save_config()
+            rumps.notification("WhisperFlow", "Vocabulary", f"Added: {term}")
+
+    def _add_vocab_fix(self):
+        resp = rumps.Window(
+            message="Add a correction as  wrong = right   "
+                    "(e.g.  olama = Ollama):",
+            title="Correction", default_text="", ok="Add", cancel="Cancel",
+            dimensions=(320, 22),
+        ).run()
+        if resp.clicked and "=" in resp.text:
+            wrong, right = (s.strip() for s in resp.text.split("=", 1))
+            if wrong and right:
+                self.config.setdefault("vocabulary", {}).setdefault(
+                    "fixes", {})[wrong] = right
+                self._save_config()
+                rumps.notification("WhisperFlow", "Correction",
+                                   f"{wrong} → {right}")
+
+    def _set_cue_sound(self, which, name):
+        self.config.setdefault("sound_cues", {})[which] = name
+        self._save_config()
+        from .sound import _play
+
+        _play(name)  # preview
+
     def set_pill_style(self, style):
         """Switch the on-screen indicator between the Marvin face and the
         waveform bar. Recreates the pill window (sizes differ)."""
@@ -241,14 +311,14 @@ class MenuBarApp(rumps.App):
             self._menu_callbacks.append(cb)
             parent.addItem_(item)
 
-        def submenu(title):
+        def submenu(title, parent=menu):
             parent_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 title, None, ""
             )
             sub = NSMenu.alloc().init()
             sub.setAutoenablesItems_(False)
             parent_item.setSubmenu_(sub)
-            menu.addItem_(parent_item)
+            parent.addItem_(parent_item)
             return sub
 
         header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -284,12 +354,48 @@ class MenuBarApp(rumps.App):
                     (lambda n=cname: self.pill.play_oneshot(n)), anim_sub)
 
         menu.addItem_(NSMenuItem.separatorItem())
+
+        # Input mode: hold-to-talk vs tap-to-toggle
+        toggle_on = self.config["hotkey"].get("mode", "hold") == "toggle"
+        in_sub = submenu("Input mode")
+        add("Hold to talk", lambda: self._apply_input_mode(False), in_sub,
+            state=not toggle_on)
+        add("Tap to toggle", lambda: self._apply_input_mode(True), in_sub,
+            state=toggle_on)
+
+        # Hotkey presets
+        cur_hk = self.config["hotkey"].get("push_to_talk")
+        hk_sub = submenu("Hotkey")
+        for binding, label in self._HOTKEYS:
+            add(label, (lambda b=binding: self._apply_hotkey(b)), hk_sub,
+                state=(binding == cur_hk))
+
+        # Vocabulary editor
+        vocab = self.config.get("vocabulary", {})
+        voc_sub = submenu("Vocabulary")
+        add(f"{len(vocab.get('terms', []))} words, "
+            f"{len(vocab.get('fixes', {}))} fixes", lambda: None, voc_sub,
+            enabled=False)
+        add("Add word…", lambda: self._add_vocab_word(), voc_sub)
+        add("Add correction…", lambda: self._add_vocab_fix(), voc_sub)
+
+        menu.addItem_(NSMenuItem.separatorItem())
         cleanup_on = self.config["cleanup"].get("enabled", True)
         add("AI cleanup", lambda: self._apply_cleanup(not cleanup_on), menu,
             state=cleanup_on)
-        sound_on = self.config.get("sound_cues", {}).get("enabled", True)
-        add("Sound cues", lambda: self._apply_sound(not sound_on), menu,
-            state=sound_on)
+
+        # Sounds: on/off + pick start/done from the system sounds
+        sc = self.config.get("sound_cues", {})
+        snd_sub = submenu("Sounds")
+        add("Enabled", lambda: self._apply_sound(not sc.get("enabled", True)),
+            snd_sub, state=sc.get("enabled", True))
+        start_sub = submenu("Start sound", snd_sub)
+        done_sub = submenu("Done sound", snd_sub)
+        for nm in self._SOUND_NAMES:
+            add(nm, (lambda n=nm: self._set_cue_sound("start", n)), start_sub,
+                state=(nm == sc.get("start", "Tink")))
+            add(nm, (lambda n=nm: self._set_cue_sound("done", n)), done_sub,
+                state=(nm == sc.get("done", "Pop")))
 
         menu.addItem_(NSMenuItem.separatorItem())
         paused = self.listener is None

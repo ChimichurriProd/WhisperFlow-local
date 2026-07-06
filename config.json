@@ -16,7 +16,8 @@
     "keep_alive": "30m"
   },
   "hotkey": {
-    "push_to_talk": "control + shift + space"
+    "push_to_talk": "control + shift + space",
+    "mode": "hold"
   },
   "injection": {
     "delivery_method": "clipboard",
