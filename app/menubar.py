@@ -275,6 +275,13 @@ class MenuBarApp(rumps.App):
             add(label, (lambda v=val: self.set_pill_style(v)), look_sub,
                 state=(val == cur_style))
 
+        # Preview all animations we've got.
+        if self.pill is not None and getattr(self.pill, "clips", None):
+            anim_sub = submenu("Animate")
+            for cname in sorted(self.pill.clips):
+                add(cname.capitalize(),
+                    (lambda n=cname: self.pill.play_oneshot(n)), anim_sub)
+
         menu.addItem_(NSMenuItem.separatorItem())
         cleanup_on = self.config["cleanup"].get("enabled", True)
         add("AI cleanup", lambda: self._apply_cleanup(not cleanup_on), menu,
