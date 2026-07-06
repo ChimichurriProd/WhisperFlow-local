@@ -219,20 +219,10 @@ class MenuBarApp(rumps.App):
         self.engine.set_toggle_mode(toggle)
         self._save_config()
 
-    def _rebuild_listener(self):
-        if self.listener is None:
-            return  # paused — new binding applies on resume
-        try:
-            self.listener.stop()
-        except Exception:
-            pass
-        self.listener = self.engine.build_listener()
-        self.listener.start()
-
     def _apply_hotkey(self, binding):
-        self.config["hotkey"]["push_to_talk"] = binding
+        # Change live — no listener rebuild (restarting the event tap crashes).
+        self.engine.set_hotkey(binding)
         self._save_config()
-        self._rebuild_listener()
 
     def _add_vocab_word(self):
         resp = rumps.Window(

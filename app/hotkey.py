@@ -118,6 +118,12 @@ class PushToTalkApp:
         self._max_seconds = 120.0      # hard cap so it can never record forever
         self._event_tap = None         # pynput's CGEventTap, captured for re-enable
         self._toggle = config["hotkey"].get("mode", "hold") == "toggle"
+        # live hotkey matching params (see _set_hotkey_params)
+        self._required = frozenset()
+        self._modifiers = frozenset()
+        self._rmod = None
+        self._intercept_vk = None
+        self._set_hotkey_params(config["hotkey"]["push_to_talk"])
         threading.Thread(target=self._watchdog, daemon=True).start()
 
     def set_toggle_mode(self, toggle):
@@ -134,6 +140,32 @@ class PushToTalkApp:
             self.config.get("vocabulary", {}).get("terms", [])
         )
         self._rebuild_transcriber()
+
+    def _set_hotkey_params(self, binding):
+        """Parse the binding into live matching params the listener reads each
+        event, so the hotkey can change WITHOUT rebuilding the listener (which
+        would restart the event tap and crash)."""
+        from pynput.keyboard import Key
+
+        required = parse_hotkey(binding)
+        modifiers, trigger_vk = split_combo(required)
+        rmods = {Key.cmd_r, Key.alt_r, Key.ctrl_r, Key.shift_r}
+        rmod = next(iter(required)) if (
+            len(required) == 1 and next(iter(required)) in rmods) else None
+        self._required = required
+        self._modifiers = modifiers
+        self._rmod = rmod
+        # intercept can suppress a real keyDown trigger; a right-modifier emits
+        # FlagsChanged, so it's handled via the observer path (intercept off).
+        self._intercept_vk = None if rmod is not None else trigger_vk
+        # the watchdog polls the physical keycode either way
+        self._trigger_vk = (rmod.value.vk if rmod is not None else trigger_vk)
+
+    def set_hotkey(self, binding):
+        """Change the hotkey live (no listener rebuild)."""
+        self.config["hotkey"]["push_to_talk"] = binding
+        self._set_hotkey_params(binding)
+        print(f"Hotkey changed to [{binding}]", flush=True)
 
     def _status(self, state):
         if self._on_status is not None:
@@ -273,66 +305,45 @@ class PushToTalkApp:
         import Quartz
         from pynput import keyboard
 
-        binding = self.config["hotkey"]["push_to_talk"]
-        required = parse_hotkey(binding)
-        modifiers, trigger_vk = split_combo(required)
-
-        # A single right-side modifier (e.g. "right command") is the easiest
-        # trigger, but modifier keys emit FlagsChanged (not keyDown), so the
-        # event-tap intercept can't see them — handle via the observer path.
-        from pynput.keyboard import Key
-        rmods = {Key.cmd_r, Key.alt_r, Key.ctrl_r, Key.shift_r}
-        rmod = next(iter(required)) if (
-            len(required) == 1 and next(iter(required)) in rmods) else None
-        if rmod is not None:
-            # Watchdog can still poll the physical key; intercept can't (it's a
-            # FlagsChanged event), so leave trigger_vk None for the intercept.
-            self._trigger_vk = rmod.value.vk
-            trigger_vk = None
-        else:
-            self._trigger_vk = trigger_vk
-
         pressed = self._pressed  # shared with _wait_hotkey_released
 
         def intercept(event_type, event):
-            """Swallow the trigger key at the event tap so the focused app
-            never receives it (otherwise held Ctrl+Shift+Space types stray
-            characters like ^@ into whatever you're dictating into)."""
-            if trigger_vk is None:
+            """Swallow the trigger key at the event tap so the focused app never
+            receives it. Reads the live hotkey params so the hotkey can change
+            without rebuilding the listener."""
+            tvk = self._intercept_vk
+            if tvk is None:
                 return event
             if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
                 return event
             vk = Quartz.CGEventGetIntegerValueField(
                 event, Quartz.kCGKeyboardEventKeycode
             )
-            if vk != trigger_vk:
+            if vk != tvk:
                 return event
             if event_type == Quartz.kCGEventKeyDown:
                 if self._toggle:
                     if self._active:
-                        self._stop_recording()   # tap again -> stop
+                        self._stop_recording()
                         return None
-                    if modifiers <= pressed:
-                        self._start_recording()  # tap -> start
+                    if self._modifiers <= pressed:
+                        self._start_recording()
                         return None
                     return event
-                # hold mode
                 if self._active:
                     return None  # key-repeat while recording: just swallow
-                if modifiers <= pressed:
+                if self._modifiers <= pressed:
                     self._start_recording()
                     return None
                 return event  # trigger key without the modifiers: normal typing
-            # kCGEventKeyUp
-            if not self._toggle and self._active:  # hold: release ends it
+            if not self._toggle and self._active:  # keyUp ends hold-mode dictation
                 self._stop_recording()
                 return None
             return event
 
         def on_press(key):
-            # Single right-modifier: match the raw key (canonicalize would fold
-            # left/right together, losing the right-only distinction).
-            if rmod is not None:
+            rmod = self._rmod
+            if rmod is not None:  # single right-modifier: match the raw key
                 if key == rmod:
                     if self._toggle:
                         (self._stop_recording if self._active
@@ -341,9 +352,7 @@ class PushToTalkApp:
                         self._start_recording()
                 return
             pressed.add(canonicalize(key))
-            # Fallback activation when suppression is unavailable (multi-key
-            # or unresolvable trigger): behave as a plain observer combo.
-            if trigger_vk is None and required <= pressed:
+            if self._intercept_vk is None and self._required <= pressed:
                 if self._toggle:
                     (self._stop_recording if self._active
                      else self._start_recording)()
@@ -351,22 +360,20 @@ class PushToTalkApp:
                     self._start_recording()
 
         def on_release(key):
+            rmod = self._rmod
             if rmod is not None:
                 if key == rmod and not self._toggle and self._active:
                     self._stop_recording()
                 return
             k = canonicalize(key)
             pressed.discard(k)
-            # Hold mode: releasing a modifier first also ends the dictation.
-            if not self._toggle and self._active and k in required:
+            if not self._toggle and self._active and k in self._required:
                 self._stop_recording()
 
-        print(f"Ready. Hold [{binding}] to dictate.", flush=True)
+        print(f"Ready. Hold [{self.config['hotkey']['push_to_talk']}] "
+              "to dictate.", flush=True)
         print("(If nothing happens, grant Input Monitoring and Accessibility "
               "in System Settings -> Privacy & Security.)", flush=True)
-        if trigger_vk is None:
-            print("note: hotkey suppression unavailable for this combo; the "
-                  "focused app may also see the keystrokes.", flush=True)
         listener = keyboard.Listener(
             on_press=on_press,
             on_release=on_release,
