@@ -9,10 +9,12 @@ import re
 import requests
 
 # Standalone fillers to strip (word-boundary matched, case-insensitive).
-# English + Swedish (öh/öhm/asså are the Swedish um/uh/y'know equivalents).
+# English + Swedish (öh/öhm/asså) + Spanish (o sea / esto). Kept conservative so
+# real words aren't removed.
 FILLER_WORDS = (
     "um", "uh", "uhm", "erm", "hmm", "mhm", "you know", "i mean", "like,",
     "öh", "öhm", "eh", "ehm", "asså",
+    "o sea", "esto,",
 )
 
 _FILLER_RE = re.compile(
@@ -27,8 +29,8 @@ CLEANUP_PROMPT = (
     "- Fix capitalization, punctuation, and obvious spacing only.\n"
     "- KEEP every other word exactly as spoken. Do NOT rephrase, summarize, "
     "shorten, expand, reorder, translate, or change the meaning.\n"
-    "- Keep the original language (Swedish stays Swedish, English stays "
-    "English).\n"
+    "- Keep the exact language it was spoken in (Swedish, English, Spanish, "
+    "etc.); never translate.\n"
     "- If unsure, leave the text unchanged.\n"
     "Output ONLY the cleaned text — no quotes, no commentary, no preamble.\n\n"
     "Dictated text:\n{text}"

@@ -144,7 +144,8 @@ class MenuBarApp(rumps.App):
 
     # -------------------------------------------------------------- settings
 
-    _LANGUAGES = [("Auto-detect", None), ("Svenska", "sv"), ("English", "en")]
+    _LANGUAGES = [("Auto-detect", None), ("Svenska", "sv"),
+                  ("English", "en"), ("Español", "es")]
 
     def _build_settings_menu(self):
         menu = rumps.MenuItem("Settings")
