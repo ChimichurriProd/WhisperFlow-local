@@ -91,20 +91,12 @@ try:
     def _hover_label(model):
         return f"Model: {model}"
 
-    def _load_marvin_poses():
-        """Load the named 3D head poses (center/up/down/left/right) as NSImages."""
+    def _load_marvin_center():
+        """Load the resting head image (center.png), shown when idle."""
         from pathlib import Path
 
-        d = Path(__file__).resolve().parent.parent / "assets" / "marvin"
-        poses = {}
-        if d.is_dir():
-            for name in ("center", "up", "down", "left", "right"):
-                p = d / f"{name}.png"
-                if p.exists():
-                    img = NSImage.alloc().initWithContentsOfFile_(str(p))
-                    if img is not None:
-                        poses[name] = img
-        return poses
+        p = Path(__file__).resolve().parent.parent / "assets" / "marvin" / "center.png"
+        return NSImage.alloc().initWithContentsOfFile_(str(p)) if p.exists() else None
 
     def _load_marvin_clips():
         """Load frame-sequence clips from assets/marvin/<name>/frame_*.png plus
@@ -231,8 +223,8 @@ try:
             h = self.frame().size.height
 
             if c.style == "marvin":
-                if c.clips or c.poses.get("center") is not None:
-                    self._draw_marvin_image(c, w, h)  # video flipbook / poses
+                if c.clips or c.center is not None:
+                    self._draw_marvin_image(c, w, h)  # video flipbook / still
                     return
                 # fallback (no assets): 2D fake tilt/nod on the vector face
                 NSGraphicsContext.saveGraphicsState()
@@ -309,7 +301,7 @@ try:
                 fi = max(0, min(len(clip) - 1, int(c._clip_f)))
                 img = clip[fi]
             else:
-                img = c.poses.get("center")
+                img = c.center
             if img is None:
                 return
             img.drawInRect_(rect)  # simple draw is flip-safe and opaque
@@ -454,7 +446,7 @@ try:
             self.mode = "idle"
             self.model = "small"
             self.hover = False
-            self.poses = _load_marvin_poses() if style == "marvin" else {}
+            self.center = _load_marvin_center() if style == "marvin" else None
             self.clips, self.clip_eyes = (
                 _load_marvin_clips() if style == "marvin" else ({}, {})
             )
