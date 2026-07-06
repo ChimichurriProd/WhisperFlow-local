@@ -110,6 +110,25 @@ def test_ollama_clean_sends_temperature_zero(config):
     assert captured["options"]["temperature"] == 0.0
 
 
+def test_setting_changes_dont_crash():
+    """Every runtime setting change must be safe (no listener rebuild, etc.)."""
+    from app.config import load_config as _lc
+    from app.hotkey import PushToTalkApp
+    from app.menubar import MenuBarApp
+
+    eng = PushToTalkApp(_lc())
+    for binding, _label in MenuBarApp._HOTKEYS:
+        eng.set_hotkey(binding)          # must not crash / rebuild the listener
+    eng.set_toggle_mode(True)
+    eng.set_toggle_mode(False)
+    eng.set_paused(True)
+    eng.set_paused(False)
+    eng.set_language("es")
+    eng.set_language(None)
+    eng.set_model("small")
+    eng.reload_vocabulary()
+
+
 def test_sound_cues_respect_toggle():
     from app import sound
 

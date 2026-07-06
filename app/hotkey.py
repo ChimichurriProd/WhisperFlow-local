@@ -124,8 +124,16 @@ class PushToTalkApp:
         self._rmod = None
         self._intercept_vk = None
         self._rmod_flag = None
+        self._paused = False
         self._set_hotkey_params(config["hotkey"]["push_to_talk"])
         threading.Thread(target=self._watchdog, daemon=True).start()
+
+    def set_paused(self, paused):
+        """Pause/resume dictation without touching the listener (restarting the
+        event tap crashes). While paused the hotkey simply does nothing."""
+        self._paused = bool(paused)
+        if paused and self._active:
+            self._stop_recording("paused")
 
     def set_toggle_mode(self, toggle):
         """Switch between hold-to-talk and tap-to-toggle. If we're mid-recording
@@ -182,7 +190,7 @@ class PushToTalkApp:
 
     def _start_recording(self):
         with self._state_lock:
-            if self._active:
+            if self._active or self._paused:
                 return
             self._active = True
             self._rec_start = time.monotonic()

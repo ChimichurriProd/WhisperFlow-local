@@ -34,7 +34,10 @@ class _MenuTarget(NSObject):
         cbs = getattr(self._app, "_menu_callbacks", [])
         idx = sender.tag()
         if 0 <= idx < len(cbs):
-            cbs[idx]()
+            try:
+                cbs[idx]()
+            except Exception as exc:  # never let a setting change crash the app
+                print(f"[menu] action failed: {exc!r}", flush=True)
 
 # Plain-text titles: emoji can render as an invisible glyph in the macOS menu
 # bar on some systems, so we use short text labels that always show.
@@ -89,6 +92,7 @@ class MenuBarApp(rumps.App):
         self.engine = PushToTalkApp(config, on_status=self.set_state)
         self.listener = self.engine.build_listener()
         self.listener.start()
+        self._paused = False  # dictation paused via engine flag (not by stopping)
 
         # Floating pill = the primary UI. Driven by a main-thread timer that
         # reads the shared mode + live mic level (both set from other threads).
@@ -389,8 +393,7 @@ class MenuBarApp(rumps.App):
                 state=(nm == sc.get("done", "Pop")))
 
         menu.addItem_(NSMenuItem.separatorItem())
-        paused = self.listener is None
-        add("Resume listening" if paused else "Pause listening",
+        add("Resume listening" if self._paused else "Pause listening",
             lambda: self.toggle_pause(self.pause_item), menu)
         add("Quit WhisperFlow", lambda: rumps.quit_application(), menu)
 
@@ -446,16 +449,14 @@ class MenuBarApp(rumps.App):
         self._mode = state
 
     def toggle_pause(self, sender):
-        if self.listener is not None:
-            self.listener.stop()
-            self.listener = None
-            sender.title = "Resume listening"
-            self.set_state("paused")
-        else:
-            self.listener = self.engine.build_listener()
-            self.listener.start()
-            sender.title = "Pause listening"
-            self.set_state("idle")
+        # Pause via a flag — never stop/restart the listener (that crashes).
+        self._paused = not self._paused
+        self.engine.set_paused(self._paused)
+        try:
+            sender.title = "Resume listening" if self._paused else "Pause listening"
+        except Exception:
+            pass
+        self.set_state("paused" if self._paused else "idle")
 
 
 def _hide_dock_icon():
