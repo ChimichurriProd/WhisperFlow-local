@@ -148,11 +148,12 @@ class MenuBarApp(rumps.App):
                   ("English", "en"), ("Español", "es")]
 
     _HOTKEYS = [
-        ("control + shift + space", "Control + Shift + Space"),
-        ("command + shift + space", "Command + Shift + Space"),
-        ("control + option + space", "Control + Option + Space"),
-        ("f9", "F9"),
-        ("f13", "F13"),
+        ("right command", "Right ⌘  (hold, one thumb) — easiest"),
+        ("right option", "Right ⌥  (hold, one thumb)"),
+        ("option + space", "⌥ + Space  (one hand)"),
+        ("control + space", "⌃ + Space  (one hand)"),
+        ("control + shift + space", "⌃⇧Space  (default)"),
+        ("f9", "F9  (needs the fn setting on laptops)"),
     ]
 
     _SOUND_NAMES = ["Tink", "Pop", "Glass", "Ping", "Bottle", "Frog",

@@ -33,6 +33,11 @@ def parse_hotkey(spec):
         "cmd": Key.cmd, "command": Key.cmd, "win": Key.cmd,
         "space": Key.space, "tab": Key.tab, "enter": Key.enter,
         "esc": Key.esc, "escape": Key.esc,
+        # single right-side modifiers (held alone as an easy trigger)
+        "right control": Key.ctrl_r, "right ctrl": Key.ctrl_r,
+        "right shift": Key.shift_r,
+        "right option": Key.alt_r, "right alt": Key.alt_r,
+        "right command": Key.cmd_r, "right cmd": Key.cmd_r,
     }
     keys = set()
     for part in spec.split("+"):
@@ -271,7 +276,22 @@ class PushToTalkApp:
         binding = self.config["hotkey"]["push_to_talk"]
         required = parse_hotkey(binding)
         modifiers, trigger_vk = split_combo(required)
-        self._trigger_vk = trigger_vk  # let the watchdog check physical key state
+
+        # A single right-side modifier (e.g. "right command") is the easiest
+        # trigger, but modifier keys emit FlagsChanged (not keyDown), so the
+        # event-tap intercept can't see them — handle via the observer path.
+        from pynput.keyboard import Key
+        rmods = {Key.cmd_r, Key.alt_r, Key.ctrl_r, Key.shift_r}
+        rmod = next(iter(required)) if (
+            len(required) == 1 and next(iter(required)) in rmods) else None
+        if rmod is not None:
+            # Watchdog can still poll the physical key; intercept can't (it's a
+            # FlagsChanged event), so leave trigger_vk None for the intercept.
+            self._trigger_vk = rmod.value.vk
+            trigger_vk = None
+        else:
+            self._trigger_vk = trigger_vk
+
         pressed = self._pressed  # shared with _wait_hotkey_released
 
         def intercept(event_type, event):
@@ -310,6 +330,16 @@ class PushToTalkApp:
             return event
 
         def on_press(key):
+            # Single right-modifier: match the raw key (canonicalize would fold
+            # left/right together, losing the right-only distinction).
+            if rmod is not None:
+                if key == rmod:
+                    if self._toggle:
+                        (self._stop_recording if self._active
+                         else self._start_recording)()
+                    elif not self._active:
+                        self._start_recording()
+                return
             pressed.add(canonicalize(key))
             # Fallback activation when suppression is unavailable (multi-key
             # or unresolvable trigger): behave as a plain observer combo.
@@ -321,6 +351,10 @@ class PushToTalkApp:
                     self._start_recording()
 
         def on_release(key):
+            if rmod is not None:
+                if key == rmod and not self._toggle and self._active:
+                    self._stop_recording()
+                return
             k = canonicalize(key)
             pressed.discard(k)
             # Hold mode: releasing a modifier first also ends the dictation.
