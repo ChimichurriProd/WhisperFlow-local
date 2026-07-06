@@ -223,6 +223,8 @@ class MenuBarApp(rumps.App):
 
     def show_pill_menu(self, view, event):
         """Build and pop up a native menu at the pill (right/control-click)."""
+        if self.pill is not None:
+            self.pill.play_oneshot("react")  # a little reaction (if present)
         menu = NSMenu.alloc().init()
         menu.setAutoenablesItems_(False)
         self._menu_callbacks = []

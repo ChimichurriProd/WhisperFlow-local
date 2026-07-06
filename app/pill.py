@@ -296,6 +296,12 @@ try:
             rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
             rect = NSMakeRect(rx, ry, rw, rh)
 
+            # A one-shot gesture (wake/spin/react) overrides everything.
+            if c._oneshot and c._oneshot in c.clips:
+                frames = c.clips[c._oneshot]
+                frames[min(len(frames) - 1, int(c._oneshot_f))].drawInRect_(rect)
+                return
+
             name = c._active_clip_name(c.mode)
             clip = c.clips.get(name) if name else None
             fi = 0
@@ -457,10 +463,12 @@ try:
             self._anim = 0.0
             self.tilt = 0.0  # head-roll degrees (vector fallback only)
             self.nod = 0.0   # vertical nod offset px (vector fallback only)
-            self._clip_f = 0.0   # current flipbook frame (float, ping-ponged)
+            self._clip_f = 0.0   # looping-clip frame (float, ping-ponged)
             self._clip_dir = 1
             self._rec_clip = "shake"   # alternates shake/nod each dictation
             self._prev_mode = "idle"
+            self._oneshot = None       # a gesture clip playing once (wake/spin/react)
+            self._oneshot_f = 0.0
             self._h = _MARVIN_SIZE if style == "marvin" else _HEIGHT
             self._w = _MARVIN_SIZE if style == "marvin" else _WIDTH_IDLE
 
@@ -574,17 +582,28 @@ try:
             self.tilt += (target - self.tilt) * 0.25
             self.nod += (nod_target - self.nod) * 0.25
 
-            # On each new dictation, alternate which gesture he does.
+            # Mode transitions trigger one-shot gestures.
             if mode == "recording" and self._prev_mode != "recording":
                 order = [n for n in ("shake", "nod") if n in self.clips]
-                if order:
+                if order:  # alternate the listening loop each dictation
                     cur = self._rec_clip if self._rec_clip in order else order[0]
                     self._rec_clip = order[(order.index(cur) + 1) % len(order)]
+                self.play_oneshot("wake")     # perk up when you start (if present)
+            elif mode == "transcribing" and self._prev_mode == "recording":
+                self.play_oneshot("spin")     # flourish when you finish
             self._prev_mode = mode
 
-            # Flipbook clip: play the gesture while dictating (ping-pong so it
-            # loops seamlessly); hold still on the centre frame when idle.
-            clip = self._active_clip(mode)
+            # Advance a one-shot gesture (plays once, then clears).
+            if self._oneshot:
+                frames = self.clips.get(self._oneshot)
+                if frames and self._oneshot_f < len(frames) - 1:
+                    self._oneshot_f += 1.0
+                else:
+                    self._oneshot = None
+
+            # Advance the looping listening clip (ping-pong) unless a one-shot
+            # is playing; hold still on centre when idle.
+            clip = None if self._oneshot else self._active_clip(mode)
             if clip:
                 n = len(clip)
                 self._clip_f += self._clip_dir * 0.8
@@ -598,6 +617,12 @@ try:
                 self._clip_f = 0.0
                 self._clip_dir = 1
             self._render()
+
+        def play_oneshot(self, name):
+            """Trigger a gesture clip to play through once (no-op if absent)."""
+            if name in self.clips:
+                self._oneshot = name
+                self._oneshot_f = 0.0
 
         def _active_clip_name(self, mode):
             if mode == "recording":
