@@ -123,6 +123,7 @@ class PushToTalkApp:
         self._modifiers = frozenset()
         self._rmod = None
         self._intercept_vk = None
+        self._rmod_flag = None
         self._set_hotkey_params(config["hotkey"]["push_to_talk"])
         threading.Thread(target=self._watchdog, daemon=True).start()
 
@@ -158,8 +159,16 @@ class PushToTalkApp:
         # intercept can suppress a real keyDown trigger; a right-modifier emits
         # FlagsChanged, so it's handled via the observer path (intercept off).
         self._intercept_vk = None if rmod is not None else trigger_vk
-        # the watchdog polls the physical keycode either way
-        self._trigger_vk = (rmod.value.vk if rmod is not None else trigger_vk)
+        # Watchdog: for a real key, poll its keycode. For a modifier,
+        # CGEventSourceKeyState is unreliable, so poll the modifier FLAG instead.
+        flag = {Key.cmd_r: 0x100000, Key.alt_r: 0x80000,
+                Key.ctrl_r: 0x40000, Key.shift_r: 0x20000}
+        if rmod is not None:
+            self._trigger_vk = None
+            self._rmod_flag = flag.get(rmod)
+        else:
+            self._trigger_vk = trigger_vk
+            self._rmod_flag = None
 
     def set_hotkey(self, binding):
         """Change the hotkey live (no listener rebuild)."""
@@ -208,18 +217,24 @@ class PushToTalkApp:
                     Quartz.CGEventTapEnable(tap, True)
                     print("[hotkey] event tap was disabled — re-enabled", flush=True)
 
-                if self._active:
-                    # In hold mode, a physically-released key means the release
-                    # event was missed — stop. In toggle mode the key is up on
-                    # purpose while recording, so skip this check.
-                    if (not self._toggle and self._trigger_vk is not None
-                            and not Quartz.CGEventSourceKeyState(
-                                Quartz.kCGEventSourceStateHIDSystemState,
-                                self._trigger_vk)):
+                if self._active and not self._toggle:
+                    # Hold mode: a physically-released key/modifier means the
+                    # release event was missed — stop. (Toggle mode: the key is
+                    # up on purpose, so this whole block is skipped.)
+                    released = False
+                    if self._rmod_flag is not None:  # modifier: check the flag
+                        flags = Quartz.CGEventSourceFlagsState(
+                            Quartz.kCGEventSourceStateHIDSystemState)
+                        released = not (int(flags) & self._rmod_flag)
+                    elif self._trigger_vk is not None:  # real key: check keycode
+                        released = not Quartz.CGEventSourceKeyState(
+                            Quartz.kCGEventSourceStateHIDSystemState,
+                            self._trigger_vk)
+                    if released:
                         self._stop_recording("watchdog: key released")
                         continue
-                    if time.monotonic() - self._rec_start > self._max_seconds:
-                        self._stop_recording("watchdog: max duration")
+                if self._active and time.monotonic() - self._rec_start > self._max_seconds:
+                    self._stop_recording("watchdog: max duration")
             except Exception:
                 pass
 
