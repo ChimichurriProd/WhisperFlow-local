@@ -21,3 +21,6 @@ WhisperFlow.app/
 *.gguf
 models/
 assets/marvin/*.mp4
+
+# Local backup of superseded Marvin assets (git history already versions these)
+assets/_marvin_versions/

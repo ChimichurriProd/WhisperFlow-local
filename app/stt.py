@@ -11,6 +11,8 @@ Two engines:
 Both bias toward custom-vocabulary terms via initial_prompt.
 """
 
+import concurrent.futures
+
 # config model name -> mlx-community HF repo
 _MLX_REPOS = {
     "base": "mlx-community/whisper-base-mlx",
@@ -46,6 +48,8 @@ class Transcriber:
         self.compute_type = compute_type
         self.initial_prompt = initial_prompt
         self._fw_model = None  # faster-whisper instance (lazy)
+        self._mlx_pool = None  # single-thread executor for MLX (lazy)
+        self._mlx_fails = 0    # consecutive MLX failures -> auto-disable
 
     def transcribe(self, audio):
         """audio: 1-D float32 at 16 kHz. Returns the joined transcript string."""
@@ -53,16 +57,38 @@ class Transcriber:
             return ""
         if self.engine == "mlx":
             try:
-                return self._transcribe_mlx(audio)
-            except ImportError:
-                print("[stt] mlx-whisper unavailable; using faster-whisper",
+                text = self._transcribe_mlx(audio)
+                self._mlx_fails = 0
+                return text
+            except Exception as exc:
+                # Never let an MLX failure (e.g. the GPU-stream threading error
+                # "There is no Stream(gpu, N) in current thread") kill dictation:
+                # fall back to the CPU engine for this utterance, and disable
+                # MLX after repeated failures so we stop paying its retry cost.
+                self._mlx_fails += 1
+                print(f"[stt] mlx-whisper failed "
+                      f"({type(exc).__name__}: {exc}); using faster-whisper",
                       flush=True)
-                self.engine = "faster-whisper"
+                if isinstance(exc, ImportError) or self._mlx_fails >= 2:
+                    print("[stt] disabling mlx for this session", flush=True)
+                    self.engine = "faster-whisper"
         return self._transcribe_faster_whisper(audio)
 
     # ------------------------------------------------------------- mlx (GPU)
 
     def _transcribe_mlx(self, audio):
+        # MLX arrays and GPU streams are thread-affine: a model cached on the
+        # thread that first loaded it cannot be evaluated from another thread
+        # ("There is no Stream(gpu, N) in current thread"). on_release spawns a
+        # fresh thread per dictation, so we pin ALL MLX work to one persistent
+        # worker thread and block on its result.
+        if self._mlx_pool is None:
+            self._mlx_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="mlx-stt"
+            )
+        return self._mlx_pool.submit(self._run_mlx, audio).result()
+
+    def _run_mlx(self, audio):
         import mlx_whisper  # lazy: pulls in MLX
 
         repo = _MLX_REPOS.get(self.model_name, _MLX_REPOS["large-v3-turbo"])

@@ -85,8 +85,11 @@ class MenuBarApp(rumps.App):
 
         self.settings_menu = self._build_settings_menu()
 
+        self.demo_item = rumps.MenuItem(
+            "Play all animations", callback=self._play_all_anims
+        )
         self.menu = [self.status_item, self.model_menu, self.settings_menu,
-                     self.perms_item, self.pause_item, None,
+                     self.perms_item, self.pause_item, self.demo_item, None,
                      rumps.MenuItem("Quit", callback=rumps.quit_application)]
 
         self.engine = PushToTalkApp(config, on_status=self.set_state)
@@ -105,11 +108,32 @@ class MenuBarApp(rumps.App):
             on_click=self.cycle_model, on_move=self._save_pill_pos,
             on_menu=self.show_pill_menu, pos=pos,
             style=config.get("ui", {}).get("pill_style", "waveform"),
+            on_double_click=self._marvin_speak,
         )
         if self.pill is not None:
             self.pill.set_model(config["stt"]["model"])
         self._pill_timer = rumps.Timer(self._drive_pill, 0.05)
         self._pill_timer.start()
+
+        # Marvin's shared TTS voice. The Speaker itself is cheap; the ~310MB
+        # Kokoro model is warmed on a background thread at launch so the first
+        # double-click-to-talk is snappy instead of paying the load then.
+        self._speaking = False
+        try:
+            from .tts import Speaker
+            self._speaker = Speaker()
+        except Exception:
+            self._speaker = None
+        if self._speaker is not None and config.get("ui", {}).get(
+                "double_click_talk", True):
+            import threading
+            from .tts import _QUIPS
+
+            def _warm_and_cache():
+                self._speaker.warm()
+                self._speaker.prerender(_QUIPS)  # so clicks play instantly
+
+            threading.Thread(target=_warm_and_cache, daemon=True).start()
 
         if not trusted:
             self.set_state("blocked")
@@ -125,12 +149,17 @@ class MenuBarApp(rumps.App):
 
         if self.pill is None:
             return
-        # blocked/paused show as the idle dot (no active waveform).
-        pill_mode = "idle" if mode in ("idle", "blocked", "paused") else mode
+        # blocked shows as idle; paused = Marvin dozes off (sleep clip), else idle.
+        if mode == "paused" and self.pill.style == "marvin":
+            pill_mode = "sleep"
+        elif mode in ("idle", "blocked", "paused"):
+            pill_mode = "idle"
+        else:
+            pill_mode = mode
         level = self.engine.recorder.level if pill_mode == "recording" else 0.0
         # Waveform idle costs nothing once settled; Marvin keeps a subtle idle
         # bob so he always looks a little alive.
-        if (pill_mode == "idle" and self.pill.style != "marvin"
+        if (pill_mode == "idle" and self.pill.style not in ("marvin", "marvin_live")
                 and not self.pill.hover
                 and not any(v > 0.001 for v in self.pill.levels)):
             return
@@ -211,11 +240,55 @@ class MenuBarApp(rumps.App):
         self._sound_item.state = 1 if enabled else 0
         self._save_config()
 
+    # -------- Marvin speaks (double-click / local TTS) ---------------------
+
+    def _apply_talk(self, enabled):
+        self.config.setdefault("ui", {})["double_click_talk"] = enabled
+        self._save_config()
+
+    def _marvin_speak(self, force=False):
+        """Double-click Marvin -> he says a random deadpan quip. Synth + play run
+        on a daemon thread so the UI never blocks; overlapping calls are ignored
+        while one is still speaking. `force` bypasses the on/off setting (used by
+        the 'Say something' menu item)."""
+        if not force and not self.config.get("ui", {}).get("double_click_talk", True):
+            return
+        if getattr(self, "_speaking", False):
+            return
+        self._speaking = True
+        if self.pill is not None:
+            try:
+                self.pill.play_oneshot("alert")  # perk up as he speaks
+            except Exception:
+                pass
+
+        def _run():
+            try:
+                import random
+                from .tts import _QUIPS
+                if getattr(self, "_speaker", None) is None:
+                    from .tts import Speaker
+                    self._speaker = Speaker()
+                self._speaker.speak(random.choice(_QUIPS))
+            except Exception as exc:  # never let TTS crash the app
+                print(f"[marvin] speak failed: {exc!r}", flush=True)
+            finally:
+                self._speaking = False
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
+
     def _toggle_cleanup(self, _sender):
         self._apply_cleanup(not self.config["cleanup"].get("enabled", True))
 
     def _toggle_sound(self, _sender):
         self._apply_sound(not self.config.get("sound_cues", {}).get("enabled", True))
+
+    def _play_all_anims(self, _sender):
+        """Showcase every Marvin gesture, back to back (no-op for waveform)."""
+        pill = getattr(self, "pill", None)
+        if pill is not None and getattr(pill, "style", None) in ("marvin", "marvin_live"):
+            pill.play_all()
 
     # -------- input mode / hotkey / vocabulary / sound pack ----------------
 
@@ -281,6 +354,7 @@ class MenuBarApp(rumps.App):
         self.pill = create_pill(
             on_click=self.cycle_model, on_move=self._save_pill_pos,
             on_menu=self.show_pill_menu, pos=pos, style=style,
+            on_double_click=self._marvin_speak,
         )
         if self.pill is not None:
             self.pill.set_model(self.config["stt"]["model"])
@@ -337,15 +411,21 @@ class MenuBarApp(rumps.App):
 
         cur_style = self.config.get("ui", {}).get("pill_style", "waveform")
         look_sub = submenu("Appearance")
-        for val, label in (("marvin", "Marvin face"), ("waveform", "Waveform")):
+        for val, label in (("marvin_live", "Marvin (live)"),
+                           ("marvin", "Marvin (clips)"), ("waveform", "Waveform")):
             add(label, (lambda v=val: self.set_pill_style(v)), look_sub,
                 state=(val == cur_style))
 
         # Preview all animations we've got.
-        if self.pill is not None and getattr(self.pill, "clips", None):
+        if self.pill is not None and getattr(self.pill, "style", None) == "marvin_live":
+            anim_sub = submenu("Animate")
+            for name in ("alert", "curious", "skeptic", "happy", "sad", "blink"):
+                add(name.capitalize(),
+                    (lambda n=name: self.pill.play_oneshot(n)), anim_sub)
+        elif self.pill is not None and getattr(self.pill, "clips", None):
             anim_sub = submenu("Animate")
             for cname in sorted(self.pill.clips):
-                add(cname.capitalize(),
+                add(cname.replace("_", " ").title(),
                     (lambda n=cname: self.pill.play_oneshot(n)), anim_sub)
 
         menu.addItem_(NSMenuItem.separatorItem())
@@ -375,6 +455,11 @@ class MenuBarApp(rumps.App):
         add("Add correction…", lambda: self._add_vocab_fix(), voc_sub)
 
         menu.addItem_(NSMenuItem.separatorItem())
+        talk_on = self.config.get("ui", {}).get("double_click_talk", True)
+        add("Double-click to talk", lambda: self._apply_talk(not talk_on), menu,
+            state=talk_on)
+        add("Say something", lambda: self._marvin_speak(force=True), menu)
+
         cleanup_on = self.config["cleanup"].get("enabled", True)
         add("AI cleanup", lambda: self._apply_cleanup(not cleanup_on), menu,
             state=cleanup_on)
@@ -457,6 +542,10 @@ class MenuBarApp(rumps.App):
         except Exception:
             pass
         self.set_state("paused" if self._paused else "idle")
+        # Wake-up animation when resuming (Marvin opens his eyes).
+        if (not self._paused and self.pill is not None
+                and "wake" in getattr(self.pill, "clips", {})):
+            self.pill.play_oneshot("wake")
 
 
 def _hide_dock_icon():

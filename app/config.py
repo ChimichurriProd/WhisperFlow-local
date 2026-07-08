@@ -49,7 +49,10 @@ DEFAULTS = {
         "done": "Pop",
     },
     "ui": {
-        "pill_style": "marvin",  # "marvin" (face) | "waveform" (bars)
+        # "marvin_live" (procedural eyes) | "marvin" (baked clips) | "waveform"
+        "pill_style": "marvin_live",
+        # Double-click Marvin to hear a random deadpan quip (local TTS).
+        "double_click_talk": True,
     },
 }
 

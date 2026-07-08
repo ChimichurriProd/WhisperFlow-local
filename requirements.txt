@@ -9,6 +9,14 @@ pytest>=8.0
 mlx-whisper>=0.4.0; platform_machine == "arm64" and sys_platform == "darwin"
 faster-whisper>=1.0.0
 
+# TTS: Kokoro-82M via kokoro-onnx (onnxruntime). Gives Marvin a local voice.
+# Standalone / not wired into dictation — see app/tts.py (python -m app.tts "...").
+# Reliable on all inputs (mlx-audio's MLX Kokoro vocoder fails on ~10-20%).
+# Bundles its own espeak via espeakng-loader — no brew/spaCy/misaki needed. On
+# Python 3.14 install prebuilt wheels: pip install --only-binary=:all: kokoro-onnx
+# The ~330MB model files auto-download once to ~/.cache/kokoro-onnx/ on first use.
+kokoro-onnx>=0.4.7
+
 # macOS system integration: global hotkey listener + keystroke synthesis.
 # Clipboard uses the built-in pbcopy/pbpaste, no extra dependency.
 pynput>=1.7.6
