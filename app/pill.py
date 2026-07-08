@@ -21,8 +21,14 @@ _HEIGHT = 32.0
 _WIDTH_IDLE = 32.0  # equals height => a round dot when idle
 _WIDTH_REC = 250.0  # hover width is measured from the label (see _target_width)
 _BARS = 24
-_MARVIN_SIZE = 100.0  # window (larger than the head so the eye-glow has room)
-_MARVIN_INSET = 0.18  # head is ~64px inside the window; margin holds the glow
+_MARVIN_SIZE = 280.0  # big window so the super_saiyan aura can flare FAR beyond the head box
+# without clipping. The extra window is transparent/invisible — only Marvin + his aura show.
+_MARVIN_INSET = 0.386  # normal head ~58px in the window
+# super_saiyan: Marvin's head stays FIXED at the idle size; the golden aura flares far BEYOND the
+# head box into the big window and never clips. A fixed (larger) inset keeps the head == idle size
+# while the aura fills out to ~125px from centre — well inside the 280px window.
+_SS_CLIP = "super_saiyan"
+_SS_INSET = 0.114
 
 # Clip names eligible as idle micro-gestures: while resting, Marvin randomly
 # plays one of these every so often to read as alive. A name only joins the
@@ -364,7 +370,12 @@ try:
             """Draw one Marvin frame (the current flipbook frame while a clip is
             active, else the still centre pose) and, while dictating, add a
             voice-reactive green bloom over the frame's eyes."""
-            m = w * _MARVIN_INSET
+            shown = (c._oneshot if (c._oneshot and c._oneshot in c.clips)
+                     else c._active_clip_name(c.mode))
+            # super_saiyan: draw at a fixed larger rect so the head == idle size while the aura
+            # flares beyond the head box; every other clip uses the normal head-box inset.
+            base_inset = _SS_INSET if shown == _SS_CLIP else _MARVIN_INSET
+            m = w * base_inset
             rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
             rect = NSMakeRect(rx, ry, rw, rh)
 
@@ -937,7 +948,7 @@ try:
                 return
             order = ["wake", "alert", "happy", "sad", "angry", "skeptic", "blink",
                      "glance", "look_left", "look_right", "nod", "shake",
-                     "emote", "spin"]
+                     "emote", "super_saiyan", "spin"]
             queue = [n for n in order if n in self.clips]
             # append any other loaded clips (e.g. sleep) at the end, for completeness
             queue += [n for n in self.clips if n not in queue]
