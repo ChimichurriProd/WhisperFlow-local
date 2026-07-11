@@ -49,8 +49,8 @@ DEFAULTS = {
         "done": "Pop",
     },
     "ui": {
-        # "marvin_live" (procedural eyes) | "marvin" (baked clips) | "waveform"
-        "pill_style": "marvin_live",
+        # "marvin" (baked clips) | "waveform"
+        "pill_style": "marvin",
         # Double-click Marvin to hear a random deadpan quip (local TTS).
         "double_click_talk": True,
     },
@@ -76,6 +76,10 @@ def load_config(path=None):
                 cfg[section].update(values)
             else:
                 cfg[section] = values
+    # Migration: the procedural "marvin_live" style was removed — old saved
+    # configs fall back to the baked-clips Marvin.
+    if cfg.get("ui", {}).get("pill_style") == "marvin_live":
+        cfg["ui"]["pill_style"] = "marvin"
     method = cfg["injection"]["delivery_method"]
     if method not in VALID_DELIVERY_METHODS:
         raise ValueError(

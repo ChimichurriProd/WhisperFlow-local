@@ -160,7 +160,7 @@ class MenuBarApp(rumps.App):
         level = self.engine.recorder.level if pill_mode == "recording" else 0.0
         # Waveform idle costs nothing once settled; Marvin keeps a subtle idle
         # bob so he always looks a little alive.
-        if (pill_mode == "idle" and self.pill.style not in ("marvin", "marvin_live")
+        if (pill_mode == "idle" and self.pill.style != "marvin"
                 and not self.pill.hover
                 and not any(v > 0.001 for v in self.pill.levels)):
             return
@@ -288,7 +288,7 @@ class MenuBarApp(rumps.App):
     def _play_all_anims(self, _sender):
         """Showcase every Marvin gesture, back to back (no-op for waveform)."""
         pill = getattr(self, "pill", None)
-        if pill is not None and getattr(pill, "style", None) in ("marvin", "marvin_live"):
+        if pill is not None and getattr(pill, "style", None) == "marvin":
             pill.play_all()
 
     # -------- input mode / hotkey / vocabulary / sound pack ----------------
@@ -412,18 +412,12 @@ class MenuBarApp(rumps.App):
 
         cur_style = self.config.get("ui", {}).get("pill_style", "waveform")
         look_sub = submenu("Appearance")
-        for val, label in (("marvin_live", "Marvin (live)"),
-                           ("marvin", "Marvin (clips)"), ("waveform", "Waveform")):
+        for val, label in (("marvin", "Marvin"), ("waveform", "Waveform")):
             add(label, (lambda v=val: self.set_pill_style(v)), look_sub,
                 state=(val == cur_style))
 
         # Preview all animations we've got.
-        if self.pill is not None and getattr(self.pill, "style", None) == "marvin_live":
-            anim_sub = submenu("Animate")
-            for name in ("alert", "curious", "skeptic", "happy", "sad", "blink"):
-                add(name.capitalize(),
-                    (lambda n=name: self.pill.play_oneshot(n)), anim_sub)
-        elif self.pill is not None and getattr(self.pill, "clips", None):
+        if self.pill is not None and getattr(self.pill, "clips", None):
             anim_sub = submenu("Animate")
             for cname in sorted(self.pill.clips):
                 add(cname.replace("_", " ").title(),
@@ -547,11 +541,9 @@ class MenuBarApp(rumps.App):
         except Exception:
             pass
         self.set_state("paused" if self._paused else "idle")
-        # Wake-up animation when resuming (Marvin opens his eyes). marvin_live
-        # has no clips dict — it maps "wake" to a procedural expression.
+        # Wake-up animation when resuming (Marvin opens his eyes).
         if not self._paused and self.pill is not None and (
-                "wake" in getattr(self.pill, "clips", {})
-                or getattr(self.pill, "style", None) == "marvin_live"):
+                "wake" in getattr(self.pill, "clips", {})):
             self.pill.play_oneshot("wake")
 
 

@@ -30,6 +30,16 @@ _MARVIN_INSET = 0.386  # normal head ~58px in the window
 _SS_CLIP = "super_saiyan"
 _SS_INSET = 0.114
 
+# Per-STT-model idle loop clips: when assets/marvin/<clip>/ exists for the
+# active model, Marvin's resting loop plays it (largest model = electric,
+# smallest = sleepy) so you can tell at a glance which model is loaded.
+_MODEL_IDLE_CLIP = {
+    "base": "idle_base",
+    "small": "idle_small",
+    "medium": "idle_medium",
+    "large-v3-turbo": "idle_large",
+}
+
 # Clip names eligible as idle micro-gestures: while resting, Marvin randomly
 # plays one of these every so often to read as alive. A name only joins the
 # pool if a matching assets/marvin/<name>/ clip exists, so dropping in a new
@@ -39,39 +49,6 @@ _IDLE_GESTURE_CLIPS = ("skeptic", "curious", "glance", "blink", "yawn", "emote")
 # Per-clip one-shot playback speed (frames advanced per 20 Hz tick; default 1.0).
 # spin is a 120-frame full 360°; 2.4/tick plays it in ~2.5 s as a quick flourish.
 _ONESHOT_SPEED = {"spin": 2.4}
-
-# ---------------------------------------------------------------------------
-# marvin_live: real-time procedural eyes drawn over an eyeless grey head.
-# The eyes are the code's, not baked frames — they blink, dart, follow the
-# cursor and glow with your voice. See scripts/make_eyeless_head.py for the
-# head asset + eye geometry these numbers come from.
-# ---------------------------------------------------------------------------
-# Base eye centres + size in the eyeless head's normalized frame (y from top).
-_EYE_L = (0.342, 0.545)
-_EYE_R = (0.658, 0.545)
-_EYE_W = 0.205          # eye width  (fraction of head)
-_EYE_H = 0.150          # eye full height (fraction of head)
-_EYE_GREEN = (0.53, 1.0, 0.44)
-
-# Per-eye expression targets. ap=aperture 0..1 (1 wide open, 0 shut),
-# off=vertical centre shift (+down = sleepy), bow=edge curvature (+up happy /
-# -down sad), outer=outer-corner drop (+down). Symmetric unless in _EXPR_ASYM.
-_EXPR = {
-    "neutral": {"ap": 0.44, "off": 0.14, "bow": 0.00, "outer": 0.00},
-    "alert":   {"ap": 1.00, "off": 0.00, "bow": 0.00, "outer": 0.00},
-    "happy":   {"ap": 0.34, "off": -0.10, "bow": 0.95, "outer": 0.00},
-    "sad":     {"ap": 0.50, "off": 0.16, "bow": -0.35, "outer": 0.55},
-    "curious": {"ap": 0.92, "off": -0.06, "bow": 0.12, "outer": -0.12},
-}
-# Explicit per-eye (left, right) for asymmetric expressions.
-_EXPR_ASYM = {
-    "skeptic": ({"ap": 0.16, "off": 0.22, "bow": 0.00, "outer": 0.10},
-                {"ap": 0.95, "off": -0.04, "bow": 0.00, "outer": -0.18}),
-}
-# Blink aperture multipliers over successive ticks (20 Hz): close ~2, hold,
-# open ~3 — a natural ~250 ms blink applied on top of any expression.
-_BLINK_SEQ = (0.55, 0.12, 0.0, 0.0, 0.35, 0.7, 0.9, 1.0)
-
 
 try:
     from AppKit import (
@@ -145,17 +122,6 @@ try:
         from pathlib import Path
 
         p = Path(__file__).resolve().parent.parent / "assets" / "marvin" / "center.png"
-        return NSImage.alloc().initWithContentsOfFile_(str(p)) if p.exists() else None
-
-    def _load_marvin_eyeless():
-        """Load the eyeless grey head (center_eyeless.png) that marvin_live draws
-        its procedural eyes over. Falls back to center.png if absent."""
-        from pathlib import Path
-
-        base = Path(__file__).resolve().parent.parent / "assets" / "marvin"
-        p = base / "center_eyeless.png"
-        if not p.exists():
-            p = base / "center.png"
         return NSImage.alloc().initWithContentsOfFile_(str(p)) if p.exists() else None
 
     def _load_marvin_clips():
@@ -304,10 +270,6 @@ try:
             w = self.frame().size.width
             h = self.frame().size.height
 
-            if c.style == "marvin_live":
-                self._draw_marvin_live(c, w, h)  # eyeless head + procedural eyes
-                return
-
             if c.style == "marvin":
                 if c.clips or c.center is not None:
                     self._draw_marvin_image(c, w, h)  # video flipbook / still
@@ -430,87 +392,6 @@ try:
                     )
 
         @objc.python_method
-        def _draw_marvin_live(self, c, w, h):
-            """Eyeless grey head under a gentle 2D head transform, then the two
-            procedural green eyes (blink, gaze, expression, voice glow) on top."""
-            NSGraphicsContext.saveGraphicsState()
-            t = NSAffineTransform.transform()
-            t.translateXBy_yBy_(w / 2.0, h / 2.0 + c.live_bob)
-            t.rotateByDegrees_(c.live_tilt)
-            t.translateXBy_yBy_(-w / 2.0, -h / 2.0)
-            t.concat()
-
-            m = w * _MARVIN_INSET
-            rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
-            if c.eyeless is not None:
-                c.eyeless.drawInRect_(NSMakeRect(rx, ry, rw, rh))
-
-            gx, gy = c.gaze
-            hw, hh = _EYE_W * rw / 2.0, _EYE_H * rh / 2.0
-            for side, base, p in (("l", _EYE_L, c.eye_l), ("r", _EYE_R, c.eye_r)):
-                ex = rx + (base[0] + gx) * rw
-                ey = ry + (base[1] + gy) * rh + p["off"] * hh
-                self._draw_live_eye(c, side, ex, ey, hw, hh, p)
-            NSGraphicsContext.restoreGraphicsState()
-
-        @objc.python_method
-        def _draw_live_eye(self, c, side, ex, ey, hw, hh, p):
-            """One eye as a green 'lens' between an upper and lower curved lid.
-            aperture (with blink) sets openness; bow arcs it (happy/sad); outer
-            drops the outer corner (skeptic/sad). Grey head shows where the lens
-            doesn't cover, which reads as the eyelids."""
-            glow = c.live_glow
-            a = max(0.0, min(1.0, p["ap"] * c.blink)) * hh
-            bow = p["bow"] * hh
-            outer = p["outer"] * hh
-            lc_y = ey + (outer if side == "l" else 0.0)
-            rc_y = ey + (0.0 if side == "l" else outer)
-            g = _EYE_GREEN
-            bright = min(1.0, 0.88 + glow * 0.35)
-
-            # voice bloom behind the eye
-            if glow > 0.05:
-                self._live_bloom(ex, ey, hw, glow)
-
-            if a < 1.6:  # shut → a thin glowing lid seam
-                seam = NSBezierPath.bezierPath()
-                seam.moveToPoint_(NSMakePoint(ex - hw, lc_y))
-                cM = NSMakePoint(ex, ey - bow)
-                seam.curveToPoint_controlPoint1_controlPoint2_(
-                    NSMakePoint(ex + hw, rc_y), cM, cM)
-                seam.setLineWidth_(max(1.4, hh * 0.16))
-                _rgb(g[0] * bright, g[1], g[2] * bright,
-                     0.5 + glow * 0.4).setStroke()
-                seam.setLineCapStyle_(1)  # round
-                seam.stroke()
-                return
-
-            # flatter top (heavy upper lid), rounder bottom -> a weary eye
-            path = NSBezierPath.bezierPath()
-            path.moveToPoint_(NSMakePoint(ex - hw, lc_y))
-            cU = NSMakePoint(ex, ey - a * 0.80 - bow)
-            path.curveToPoint_controlPoint1_controlPoint2_(
-                NSMakePoint(ex + hw, rc_y), cU, cU)
-            cL = NSMakePoint(ex, ey + a * 1.10 - bow)
-            path.curveToPoint_controlPoint1_controlPoint2_(
-                NSMakePoint(ex - hw, lc_y), cL, cL)
-            path.closePath()
-            _rgb(g[0] * bright, g[1], g[2] * bright, 0.97).setFill()
-            path.fill()
-
-        @objc.python_method
-        def _live_bloom(self, cx, cy, hw, glow):
-            core = min(0.6, glow * 0.8)
-            for scale, alpha in ((0.9, core), (1.6, core * 0.5), (2.6, core * 0.22)):
-                rad = hw * scale
-                grad = NSGradient.alloc().initWithColors_([
-                    _rgb(0.6, 1.0, 0.5, alpha), _rgb(0.6, 1.0, 0.5, 0.0)])
-                path = NSBezierPath.bezierPathWithOvalInRect_(
-                    NSMakeRect(cx - rad, cy - rad, 2 * rad, 2 * rad))
-                grad.drawInBezierPath_relativeCenterPosition_(
-                    path, NSMakePoint(0.0, 0.0))
-
-        @objc.python_method
         def _draw_marvin_vector(self, c, w, h):
             cx, cy = w / 2.0, h / 2.0
             R = min(w, h) / 2.0 - 3.0
@@ -623,21 +504,6 @@ try:
             self.clips, self.clip_eyes = (
                 _load_marvin_clips() if style == "marvin" else ({}, {})
             )
-            # marvin_live: eyeless head + procedural eye state (see _tick_live)
-            self.eyeless = _load_marvin_eyeless() if style == "marvin_live" else None
-            self.gaze = [0.0, 0.0]         # current gaze offset (normalized)
-            self._gaze_t = [0.0, 0.0]      # gaze target
-            self.blink = 1.0               # 1 open, 0 shut (multiplies aperture)
-            self._blink_seq = []
-            self._blink_t = random.randint(40, 140)
-            self._sacc_t = random.randint(30, 80)
-            self.live_glow = 0.0           # eased voice level -> eye glow
-            self.live_bob = 0.0            # head bob (px)
-            self.live_tilt = 0.0           # head roll (deg)
-            self.eye_l = dict(_EXPR["neutral"])   # interpolated per-eye params
-            self.eye_r = dict(_EXPR["neutral"])
-            self._expr = "neutral"
-            self._expr_hold = 0            # ticks left on a one-shot expression
             self.levels = [0.0] * _BARS
             self._phase = 0.0
             self._anim = 0.0
@@ -657,7 +523,7 @@ try:
             ]
             self._idle_gesture_t = random.randint(300, 700)
             self._demo_queue = []      # remaining clips in a "play all" showcase
-            _marv = style in ("marvin", "marvin_live")
+            _marv = style == "marvin"
             self._h = _MARVIN_SIZE if _marv else _HEIGHT
             self._w = _MARVIN_SIZE if _marv else _WIDTH_IDLE
 
@@ -731,7 +597,7 @@ try:
             self._render()
 
         def _target_width(self):
-            if self.style in ("marvin", "marvin_live"):
+            if self.style == "marvin":
                 return _MARVIN_SIZE  # face stays a fixed circle
             if self.mode in ("recording", "transcribing"):
                 return _WIDTH_REC
@@ -747,10 +613,6 @@ try:
 
         def tick(self, mode, level):
             self.mode = mode
-            if self.style == "marvin_live":
-                self._tick_live(mode, level)
-                self._render()
-                return
             if mode == "recording":
                 self.levels = self.levels[1:] + [max(0.03, level)]
             elif mode == "transcribing":
@@ -827,125 +689,14 @@ try:
                 self._clip_dir = 1
             self._render()
 
-        # -------- marvin_live: procedural drive ---------------------------
-
-        def _tick_live(self, mode, level):
-            """Advance the procedural eye systems once (called at ~20 Hz)."""
-            # voice -> eye glow
-            self.live_glow += ((level if mode == "recording" else 0.0)
-                               - self.live_glow) * 0.3
-
-            # expression: hold a one-shot / demo step, else follow the mode
-            if self._expr_hold > 0:
-                self._expr_hold -= 1
-            elif self._demo_queue:
-                self._expr = self._demo_queue.pop(0)
-                self._expr_hold = 30
-            else:
-                self._expr = {"recording": "alert",
-                              "transcribing": "neutral"}.get(mode, "neutral")
-                # occasional idle micro-expression so he's never a blank stare
-                if mode == "idle" and random.random() < 0.004:
-                    self.play_oneshot(random.choice(
-                        ("curious", "skeptic", "sad", "happy")))
-
-            if self._expr in _EXPR_ASYM:
-                tl, tr = _EXPR_ASYM[self._expr]
-            else:
-                tl = tr = _EXPR.get(self._expr, _EXPR["neutral"])
-            for cur, tgt in ((self.eye_l, tl), (self.eye_r, tr)):
-                for k in ("ap", "off", "bow", "outer"):
-                    cur[k] += (tgt[k] - cur[k]) * 0.25
-
-            # blink: play the sequence, else count down to the next one
-            if self._blink_seq:
-                self.blink = self._blink_seq.pop(0)
-            else:
-                self.blink = 1.0
-                self._blink_t -= 1
-                if self._blink_t <= 0:
-                    self._blink_seq = list(_BLINK_SEQ)
-                    base = random.randint(40, 160)
-                    self._blink_t = base // 2 if mode == "recording" else base
-
-            # gaze: snappy saccades toward a target (cursor / glance) + drift
-            self._sacc_t -= 1
-            if self._sacc_t <= 0:
-                self._gaze_t = self._pick_gaze(mode)
-                self._sacc_t = random.randint(24, 80)
-            for i in (0, 1):
-                self.gaze[i] += (self._gaze_t[i] - self.gaze[i]) * 0.55
-                self.gaze[i] += random.uniform(-0.002, 0.002)
-                self.gaze[i] = max(-0.09, min(0.09, self.gaze[i]))
-
-            # head: gentle bob + tiny roll (eyes lead via gaze/blink above)
-            self._anim += 0.05
-            if mode in ("recording", "transcribing"):
-                self.live_tilt += (2.2 * math.sin(self._anim * 1.6) - self.live_tilt) * 0.2
-                self.live_bob += (1.4 * math.sin(self._anim * 2.0) - self.live_bob) * 0.2
-            else:
-                self.live_tilt += (1.0 * math.sin(self._anim * 0.7) - self.live_tilt) * 0.15
-                self.live_bob += (1.2 * math.sin(self._anim * 0.9) - self.live_bob) * 0.15
-
-            # mode-transition flourishes: perk-up blink on start, a brief happy
-            # squint when a dictation finishes (recording -> transcribing).
-            if mode == "recording" and self._prev_mode != "recording":
-                self._blink_seq = list(_BLINK_SEQ)
-            elif mode == "transcribing" and self._prev_mode == "recording":
-                self.play_oneshot("happy")
-            self._prev_mode = mode
-
-        def _pick_gaze(self, mode):
-            if mode == "transcribing":  # "thinking" — avert up and to a side
-                return [random.choice((-1.0, 1.0)) * random.uniform(0.03, 0.06),
-                        -random.uniform(0.03, 0.06)]
-            # mostly follow the cursor, sometimes disengage with a random glance
-            if random.random() < (0.7 if mode == "recording" else 0.55):
-                g = self._cursor_gaze()
-                if g is not None:
-                    return g
-            r = 0.075
-            return [random.uniform(-r, r), random.uniform(-r * 0.6, r * 0.6)]
-
-        def _cursor_gaze(self):
-            """Gaze offset toward the mouse cursor (bounded), or None on failure."""
-            try:
-                p = NSEvent.mouseLocation()
-                f = self.window.frame()
-                dx = p.x - (f.origin.x + f.size.width / 2.0)
-                dy = p.y - (f.origin.y + f.size.height / 2.0)  # screen y is up
-                scale = 500.0
-                gx = max(-1.0, min(1.0, dx / scale)) * 0.075
-                gy = max(-1.0, min(1.0, -dy / scale)) * 0.06   # up -> eyes up
-                return [gx, gy]
-            except Exception:
-                return None
-
         def play_oneshot(self, name):
-            """Trigger a gesture clip to play through once (no-op if absent).
-            In marvin_live, gesture names map to procedural expressions."""
-            if self.style == "marvin_live":
-                expr = {"wake": "alert", "spin": "happy", "nod": "happy",
-                        "shake": "skeptic", "react": "curious",
-                        "blink": "neutral"}.get(name, name)
-                if expr in _EXPR or expr in _EXPR_ASYM:
-                    self._expr = expr
-                    self._expr_hold = 26      # ~1.3 s, then eases back to mode
-                if name == "blink":
-                    self._blink_seq = list(_BLINK_SEQ)
-                return
+            """Trigger a gesture clip to play through once (no-op if absent)."""
             if name in self.clips:
                 self._oneshot = name
                 self._oneshot_f = 0.0
 
         def play_all(self):
             """Showcase: play every gesture once, back to back."""
-            if self.style == "marvin_live":
-                queue = ["alert", "curious", "skeptic", "happy", "sad", "neutral"]
-                self._expr = queue[0]
-                self._expr_hold = 30
-                self._demo_queue = queue[1:]
-                return
             order = ["wake", "alert", "happy", "sad", "angry", "skeptic", "blink",
                      "glance", "look_left", "look_right", "nod", "shake",
                      "emote", "super_saiyan", "spin"]
@@ -965,6 +716,9 @@ try:
                 return "spin" if "spin" in self.clips else None
             if mode == "sleep":
                 return "sleep" if "sleep" in self.clips else None
+            if mode == "idle":
+                name = _MODEL_IDLE_CLIP.get(self.model)
+                return name if name in self.clips else None
             return None
 
         def _active_clip(self, mode):
