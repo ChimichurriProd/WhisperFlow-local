@@ -45,7 +45,8 @@ _MODEL_IDLE_CLIP = {
 # pool if a matching assets/marvin/<name>/ clip exists, so dropping in a new
 # folder (e.g. "blink") auto-enrolls it. Excludes nod/shake/wake/spin, which
 # have their own event triggers.
-_IDLE_GESTURE_CLIPS = ("skeptic", "curious", "glance", "blink", "yawn", "emote")
+_IDLE_GESTURE_CLIPS = ("skeptic", "curious", "glance", "blink", "yawn", "emote",
+                       "angry", "love", "stressed", "glow")
 # Per-clip one-shot playback speed (frames advanced per 20 Hz tick; default 1.0).
 # spin is a 120-frame full 360°; 2.4/tick plays it in ~2.5 s as a quick flourish.
 _ONESHOT_SPEED = {"spin": 2.4}
@@ -697,7 +698,8 @@ try:
 
         def play_all(self):
             """Showcase: play every gesture once, back to back."""
-            order = ["wake", "alert", "happy", "sad", "angry", "skeptic", "blink",
+            order = ["wake", "alert", "happy", "sad", "angry", "love",
+                     "stressed", "glow", "skeptic", "blink",
                      "glance", "look_left", "look_right", "nod", "shake",
                      "emote", "super_saiyan", "spin"]
             queue = [n for n in order if n in self.clips]

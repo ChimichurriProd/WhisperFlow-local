@@ -6,14 +6,20 @@ Input: four 960x960 MP4s (Kling 2.5, black background) — one per model mood
 61 RGBA frames at 256x256, background keyed out, aura/sparks kept with
 smooth luminance alpha (same look as the super_saiyan clip).
 
-Keying per frame:
-  1. flood-fill from the borders over near-black pixels -> alpha 0
-  2. inside the head disc (r < 0.46) -> fully opaque
-  3. outside the disc, not flooded -> alpha ramps with brightness, so the
-     electric aura/sparks fade smoothly instead of ending in a hard edge
+Keying per frame (transparency-safe — no dark box/ring behind Marvin):
+  1. Find the SOLID HEAD as the largest bright connected region (head + eyes),
+     holes filled. This follows Marvin's real silhouette, so the black
+     background just outside it is never forced opaque (the old fixed-disc
+     approach left an opaque black ring between the head and the disc edge).
+  2. Head -> fully opaque.
+  3. Everything else -> alpha ramps with brightness, so the aura/sparks/glow
+     fade smoothly to transparent and pure black goes to alpha 0. Dark pixels
+     never get meaningful alpha, so nothing composites as a black tint.
 
 Usage: build_model_idles.py <videos_dir> [<out_assets_marvin_dir>]
-Expects <videos_dir>/idle_{base,small,medium,large}.mp4.
+Processes every <videos_dir>/<name>.mp4 into assets/marvin/<name>/ — works
+for the idle_* model loops and for one-shot gesture clips (angry, love,
+stressed, glow, ...) alike.
 """
 import subprocess
 import sys
@@ -22,35 +28,34 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import binary_propagation
+from scipy.ndimage import binary_fill_holes, label
 
 N_OUT = 61          # frames kept per clip (every 2nd of ~121)
 SIZE = 256
-BG_V = 20           # border flood threshold (max-channel value)
-GLOW_V = 70         # outside-head brightness that maps to full alpha
-HEAD_R = 0.46       # head disc radius (fraction of frame width)
-
-CLIPS = ("idle_base", "idle_small", "idle_medium", "idle_large")
+HEAD_V = 60         # brightness that counts as solid foreground (head/eyes)
+RAMP_LO = 24        # below this brightness -> transparent
+RAMP_HI = 92        # at/above this -> fully opaque glow
 
 
 def key_frame(img):
     a = np.asarray(img.convert("RGBA")).copy()
     v = a[..., :3].max(axis=2).astype(np.float32)
-    h, w = v.shape
 
-    # 1. background: near-black region connected to the borders
-    dark = v < BG_V
-    seed = np.zeros_like(dark)
-    seed[0, :] = seed[-1, :] = seed[:, 0] = seed[:, -1] = True
-    bg = binary_propagation(seed & dark, mask=dark)
+    # 1. solid head = largest bright connected component, holes filled. This
+    #    tracks the actual silhouette instead of a disc, so no black ring.
+    bright = v > HEAD_V
+    lbl, n = label(bright)
+    head = np.zeros_like(bright)
+    if n:
+        sizes = np.bincount(lbl.ravel())
+        sizes[0] = 0
+        head = binary_fill_holes(lbl == sizes.argmax())
 
-    # 2./3. alpha: opaque head disc, luminance ramp for the glow outside it
-    yy, xx = np.mgrid[0:h, 0:w]
-    r = np.hypot(xx - w / 2.0, yy - h / 2.0) / w
-    alpha = np.where(r < HEAD_R, 255.0,
-                     np.clip(v / GLOW_V, 0.0, 1.0) * 255.0)
-    alpha[bg] = 0.0
-    a[..., 3] = alpha.astype(np.uint8)
+    # 2./3. brightness ramp everywhere; head forced opaque. Dark bg -> ~0
+    #       alpha, so it never shows as a black tint under the transparency.
+    alpha = np.clip((v - RAMP_LO) / (RAMP_HI - RAMP_LO), 0.0, 1.0)
+    alpha[head] = 1.0
+    a[..., 3] = (alpha * 255).astype(np.uint8)
     return Image.fromarray(a, "RGBA")
 
 
@@ -76,13 +81,12 @@ def main():
     vids = Path(sys.argv[1])
     dest = Path(sys.argv[2]) if len(sys.argv) > 2 else (
         Path(__file__).resolve().parent.parent / "assets" / "marvin")
-    for name in CLIPS:
-        mp4 = vids / f"{name}.mp4"
-        if not mp4.exists():
-            print(f"skip {name} (no {mp4})")
-            continue
-        n = process(mp4, dest / name)
-        print(f"{name}: {n} frames -> {dest / name}")
+    mp4s = sorted(vids.glob("*.mp4"))
+    if not mp4s:
+        sys.exit(f"no .mp4 files in {vids}")
+    for mp4 in mp4s:
+        n = process(mp4, dest / mp4.stem)
+        print(f"{mp4.stem}: {n} frames -> {dest / mp4.stem}")
 
 
 if __name__ == "__main__":
