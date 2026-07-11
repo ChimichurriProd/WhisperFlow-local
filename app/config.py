@@ -63,7 +63,14 @@ def load_config(path=None):
     """Return DEFAULTS deep-merged with the JSON file at *path* (if given)."""
     cfg = copy.deepcopy(DEFAULTS)
     if path is not None:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # A corrupt/unreadable config (e.g. the app was killed mid-save)
+            # must not stop the app from starting: run on defaults instead.
+            print(f"[config] could not read {path} ({exc}); using defaults",
+                  flush=True)
+            data = {}
         for section, values in data.items():
             if section in cfg and isinstance(values, dict):
                 cfg[section].update(values)

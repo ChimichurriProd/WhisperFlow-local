@@ -295,9 +295,18 @@ class PushToTalkApp:
 
     def on_release(self):
         with self._busy:
-            audio = self.recorder.stop()
+            try:
+                audio = self.recorder.stop()
+            except Exception as exc:
+                # A failed mic teardown must never wedge the busy lock (that
+                # would leave the app stuck in "record" for good).
+                print(f"[rec] recorder stop failed: {exc!r}", flush=True)
+                audio = None
             self._status("transcribing")
             try:
+                if audio is None or len(audio) == 0:
+                    print("[rec] no audio captured", flush=True)
+                    return
                 seconds = len(audio) / self.config["audio"]["sample_rate"]
                 print(f"[rec] captured {seconds:.1f}s, transcribing...", flush=True)
                 raw = self.transcriber.transcribe(audio)

@@ -212,9 +212,9 @@ class Speaker:
             return None
 
     def speak(self, text, voice=None, speed=None, blocking=True):
-        """Synthesize and play through the default output device (pitch applied).
-        Uses the prerender cache for default-voice lines so there's no synth
-        delay at call time. Returns the raw (audio, sr, duration) tuple or None."""
+        """Synthesize and play (pitch applied). Uses the prerender cache for
+        default-voice lines so there's no synth delay at call time. Returns the
+        raw (audio, sr, duration) tuple or None."""
         default = voice is None and speed is None
         if default and text in self._cache:
             audio, sr = self._cache[text]
@@ -228,16 +228,45 @@ class Speaker:
         audio, sr, _ = out
         self._playing = True
         try:
-            import sounddevice as sd
-
-            sd.play(audio, int(sr * self.pitch))  # pitch = playback-rate bump
-            sd.wait()  # hold _playing until the clip finishes (prerender pauses)
+            self._play(audio, sr)
         except Exception as exc:
             print(f"[tts] playback failed ({type(exc).__name__}: {exc})",
                   flush=True)
         finally:
             self._playing = False
         return out
+
+    def _play(self, audio, sr):
+        """Play a rendered waveform, blocking until it finishes.
+
+        On macOS this deliberately does NOT use sounddevice/PortAudio: the app's
+        microphone InputStream lives in the same PortAudio instance, and
+        concurrent stream start/stop from two threads (a quip playing while a
+        dictation starts or stops) deadlocks inside CoreAudio's HAL — seen live
+        as the app stuck in "record" with the stop call parked forever in
+        AudioOutputUnitStop. afplay runs in its own process, so playback and
+        recording can never contend for the same audio-unit mutexes. The pitch
+        multiplier is baked into the WAV's sample rate.
+        """
+        import subprocess
+        import sys
+        import tempfile
+
+        if sys.platform == "darwin":
+            path = os.path.join(
+                tempfile.gettempdir(), f"whisperflow-tts-{os.getpid()}.wav"
+            )
+            write_wav(path, audio, int(sr * self.pitch))
+            subprocess.run(
+                ["afplay", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:  # non-mac fallback (no recorder conflict there in practice)
+            import sounddevice as sd
+
+            sd.play(audio, int(sr * self.pitch))
+            sd.wait()
 
 
 def write_wav(path, audio, sample_rate):

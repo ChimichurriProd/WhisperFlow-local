@@ -7,6 +7,7 @@ primary UI; the menu-bar title is a compact text fallback.
 """
 
 import json
+import os
 
 import rumps
 from AppKit import NSMenu, NSMenuItem
@@ -506,8 +507,12 @@ class MenuBarApp(rumps.App):
         if not self.config_path:
             return
         try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
+            # Atomic write (tmp + rename): a crash/kill mid-save can never
+            # leave a half-written config.json that blocks the next launch.
+            tmp = f"{self.config_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
+            os.replace(tmp, self.config_path)
         except OSError:
             pass  # non-fatal: choice still applies for this session
 
@@ -542,9 +547,11 @@ class MenuBarApp(rumps.App):
         except Exception:
             pass
         self.set_state("paused" if self._paused else "idle")
-        # Wake-up animation when resuming (Marvin opens his eyes).
-        if (not self._paused and self.pill is not None
-                and "wake" in getattr(self.pill, "clips", {})):
+        # Wake-up animation when resuming (Marvin opens his eyes). marvin_live
+        # has no clips dict — it maps "wake" to a procedural expression.
+        if not self._paused and self.pill is not None and (
+                "wake" in getattr(self.pill, "clips", {})
+                or getattr(self.pill, "style", None) == "marvin_live"):
             self.pill.play_oneshot("wake")
 
 

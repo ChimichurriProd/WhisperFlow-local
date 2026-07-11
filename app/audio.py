@@ -1,8 +1,19 @@
 """Microphone capture: start on hotkey press, stop on release, return 16 kHz mono float32."""
 
 import threading
+import time
 
 import numpy as np
+
+# One lock around every PortAudio stream transition in this process. CoreAudio's
+# HAL deadlocks (lock-order inversion between the AudioUnit and IO-proc mutexes)
+# when two threads start/stop streams at the same time — observed live as the
+# app stuck in "record" with the stop call parked forever in AudioOutputUnitStop.
+_PA_LOCK = threading.RLock()
+
+# Stopping a stream inside its start-notification window races the same
+# CoreAudio callback; a very quick hotkey tap can hit it. Enforce a minimum age.
+_MIN_STREAM_AGE = 0.25  # seconds
 
 
 class Recorder:
@@ -19,6 +30,7 @@ class Recorder:
         self._frames = []
         self._lock = threading.Lock()
         self._stream = None
+        self._started_at = 0.0
         self.level = 0.0  # live 0..1 loudness, read by the waveform UI
 
     def _callback(self, indata, frames, time_info, status):
@@ -34,20 +46,31 @@ class Recorder:
 
         with self._lock:
             self._frames = []
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype="float32",
-            callback=self._callback,
-        )
-        self._stream.start()
+        with _PA_LOCK:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="float32",
+                callback=self._callback,
+            )
+            self._stream.start()
+        self._started_at = time.monotonic()
 
     def stop(self):
         """Stop the stream and return the captured audio as 1-D float32."""
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        # Swap-then-stop so a second concurrent stop() (release event racing the
+        # watchdog) finds None instead of stopping the same stream twice.
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            age = time.monotonic() - self._started_at
+            if age < _MIN_STREAM_AGE:  # let a just-started stream finish starting
+                time.sleep(_MIN_STREAM_AGE - age)
+            with _PA_LOCK:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception as exc:  # a broken stream must not wedge dictation
+                    print(f"[rec] stream stop failed: {exc}", flush=True)
         self.level = 0.0
         with self._lock:
             frames = self._frames
