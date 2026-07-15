@@ -8,6 +8,8 @@ import re
 
 import requests
 
+from . import ollama
+
 # Standalone fillers to strip (word-boundary matched, case-insensitive).
 # English + Swedish (öh/öhm/asså) + Spanish (o sea / esto). Kept conservative so
 # real words aren't removed.
@@ -71,20 +73,12 @@ def ollama_clean(text, ollama_url, ollama_model, timeout=30, keep_alive="30m"):
     keep_alive keeps the model resident between dictations so it doesn't pay a
     multi-second cold reload each time (Ollama unloads after 5 min by default).
     """
-    resp = requests.post(
-        f"{ollama_url.rstrip('/')}/api/generate",
-        json={
-            "model": ollama_model,
-            "prompt": CLEANUP_PROMPT.format(text=text),
-            "stream": False,
-            "keep_alive": keep_alive,
-            # temperature 0 = deterministic + faithful (no creative rewrites)
-            "options": {"temperature": 0.0},
-        },
-        timeout=timeout,
+    # temperature 0 = deterministic + faithful (no creative rewrites).
+    return ollama.generate(
+        CLEANUP_PROMPT.format(text=text),
+        url=ollama_url, model=ollama_model, temperature=0.0,
+        keep_alive=keep_alive, timeout=timeout,
     )
-    resp.raise_for_status()
-    return resp.json()["response"].strip()
 
 
 def clean_transcript(text, config):

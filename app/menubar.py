@@ -93,7 +93,21 @@ class MenuBarApp(rumps.App):
                      self.perms_item, self.pause_item, self.demo_item, None,
                      rumps.MenuItem("Quit", callback=rumps.quit_application)]
 
-        self.engine = PushToTalkApp(config, on_status=self.set_state)
+        # Ask-Marvin: the engine hands answers back via _present_answer, which
+        # marshals them to the main-thread pill timer (AppKit is main-only).
+        self._bubble = None
+        self._pending_answer = None
+        # Two-faced Marvin: an ask episode turns him around to his 'oracle' back
+        # face for the whole question, then back to the front 'scribe' when done.
+        # _ask_started is set (off-thread) the moment an ask recording begins;
+        # _answering stays true for the whole episode. Both are driven on the
+        # main-thread pill timer, the only safe place to move the pill.
+        self._ask_started = False
+        self._answering = False
+        self.engine = PushToTalkApp(
+            config, on_status=self.set_state, on_answer=self._present_answer,
+            on_ask_start=self._on_ask_start,
+        )
         self.listener = self.engine.build_listener()
         self.listener.start()
         self._paused = False  # dictation paused via engine flag (not by stopping)
@@ -119,7 +133,10 @@ class MenuBarApp(rumps.App):
         # Marvin's shared TTS voice. The Speaker itself is cheap; the ~310MB
         # Kokoro model is warmed on a background thread at launch so the first
         # double-click-to-talk is snappy instead of paying the load then.
-        self._speaking = False
+        # _speak_lock serializes playback so two lines never overlap; quips drop
+        # if it's busy, answers wait for it (see _speak_text).
+        import threading
+        self._speak_lock = threading.Lock()
         try:
             from .tts import Speaker
             self._speaker = Speaker()
@@ -143,6 +160,37 @@ class MenuBarApp(rumps.App):
         # Runs on the main thread (rumps timer): the only safe place to touch
         # AppKit. Sync the menu-bar title here from the thread-safe _mode flag
         # instead of from worker threads.
+
+        # A worker thread may have parked an answer for us to present (creating
+        # the bubble / speaking must happen on the main thread).
+        pending = self._pending_answer
+        if pending is not None:
+            self._pending_answer = None
+            try:
+                self._show_answer(*pending)
+            except Exception as exc:
+                print(f"[ask] show failed: {exc!r}", flush=True)
+        if self._bubble is not None:
+            self._bubble.tick()  # auto-dismiss once its time is up
+
+        # Two-faced Marvin: turn to the oracle when an ask begins, and back to
+        # the scribe once the whole episode is over (not recording/transcribing,
+        # no bubble showing, done speaking) — covers answered, spoken, empty and
+        # failed asks alike.
+        if self.pill is not None and getattr(self.pill, "style", None) == "marvin":
+            if self._ask_started:
+                self._ask_started = False
+                self._answering = True
+                self.pill.face_back()
+            if self._answering:
+                busy = self._mode in ("recording", "transcribing")
+                bubble_up = (self._bubble is not None
+                             and getattr(self._bubble, "_visible", False))
+                speaking = self._speak_lock.locked()
+                if not busy and not bubble_up and not speaking:
+                    self._answering = False
+                    self.pill.face_front()
+
         mode = self._mode
         title = ICONS.get(mode, ICONS["idle"])
         if self.title != title:
@@ -217,6 +265,19 @@ class MenuBarApp(rumps.App):
         )
         self._sound_item.state = 1 if self.config.get("sound_cues", {}).get("enabled", True) else 0
         menu.add(self._sound_item)
+
+        ask_binding = self.config.get("hotkey", {}).get("ask", "control + shift + a")
+        self._ask_item = rumps.MenuItem(
+            f"Ask Marvin ({ask_binding})", callback=self._toggle_ask
+        )
+        self._ask_item.state = 1 if self.config.get("ask", {}).get("enabled", True) else 0
+        menu.add(self._ask_item)
+
+        self._ask_voice_item = rumps.MenuItem(
+            "Speak answers", callback=self._toggle_ask_voice
+        )
+        self._ask_voice_item.state = 1 if self.config.get("ask", {}).get("voice", True) else 0
+        menu.add(self._ask_voice_item)
         return menu
 
     def _make_lang_cb(self, code):
@@ -248,36 +309,133 @@ class MenuBarApp(rumps.App):
         self._save_config()
 
     def _marvin_speak(self, force=False):
-        """Double-click Marvin -> he says a random deadpan quip. Synth + play run
-        on a daemon thread so the UI never blocks; overlapping calls are ignored
-        while one is still speaking. `force` bypasses the on/off setting (used by
-        the 'Say something' menu item)."""
+        """Double-click Marvin -> a random deadpan quip. `force` bypasses the
+        on/off setting (the 'Say something' menu item). Quips are ambient, so
+        they're skipped when he's already speaking (drop_if_busy)."""
         if not force and not self.config.get("ui", {}).get("double_click_talk", True):
             return
-        if getattr(self, "_speaking", False):
-            return
-        self._speaking = True
+        import random
+        from .tts import _QUIPS
+
         if self.pill is not None:
             try:
                 self.pill.play_oneshot("alert")  # perk up as he speaks
             except Exception:
                 pass
+        self._speak_text(random.choice(_QUIPS), drop_if_busy=True)
+
+    # -------- Ask Marvin (Ctrl+Shift+A) ------------------------------------
+
+    def _present_answer(self, question, answer):
+        """Engine callback (worker thread): park the answer for the main-thread
+        pill timer, which owns AppKit (bubble) and kicks off speech."""
+        self._pending_answer = (question, answer)
+
+    def _speakable(self, text):
+        """Kokoro TTS is English-only. Gate on the ANSWER text (not the STT-
+        detected question language, which is easy to mis-detect on short
+        utterances): Swedish letters mean 'don't voice this', so it stays
+        text-only in the bubble."""
+        return not any(c in "åäöÅÄÖ" for c in (text or ""))
+
+    def _on_ask_start(self):
+        """Engine callback (off-thread): an ask recording has begun. Just set a
+        flag; the main-thread pill timer does the actual turn."""
+        self._ask_started = True
+
+    def _show_answer(self, question, answer):
+        """Main thread: float the answer in a bubble by Marvin, turn him to his
+        oracle back-face, and speak it when voice is on and it's a language he
+        can voice."""
+        # Also covers the typed 'Ask Marvin…' tester, which never fires
+        # on_ask_start; turning here is idempotent with the hotkey path.
+        if self.pill is not None and getattr(self.pill, "style", None) == "marvin":
+            self._answering = True
+            self.pill.face_back()
+        if self._bubble is None:
+            from .bubble import create_bubble
+
+            self._bubble = create_bubble()
+        if self._bubble is not None and self.pill is not None:
+            f = self.pill.window.frame()
+            anchor = (float(f.origin.x), float(f.origin.y),
+                      float(f.size.width), float(f.size.height))
+            self._bubble.show(answer, anchor)
+        else:
+            # No AppKit bubble available: fall back to a notification.
+            try:
+                rumps.notification("Marvin", question, answer)
+            except Exception:
+                pass
+
+        # (No front 'alert' gesture here — the turn to his back face IS the
+        # reaction, and a front clip would be invisible while he's turned away.)
+
+        if self.config.get("ask", {}).get("voice", True) and self._speakable(answer):
+            self._speak_text(answer)
+
+    def _speak_text(self, text, drop_if_busy=False):
+        """Speak *text* in Marvin's voice on a daemon thread. Playback is
+        serialized by _speak_lock so two lines never overlap: answers wait their
+        turn; ambient quips pass drop_if_busy=True to skip while he's speaking.
+        The Speaker is built lazily so a failed launch-time init still recovers."""
+        text = (text or "").strip()
+        if not text:
+            return
+        if drop_if_busy and self._speak_lock.locked():
+            return
+        if self._speaker is None:
+            try:
+                from .tts import Speaker
+                self._speaker = Speaker()
+            except Exception:
+                self._speaker = None
+                return
 
         def _run():
-            try:
-                import random
-                from .tts import _QUIPS
-                if getattr(self, "_speaker", None) is None:
-                    from .tts import Speaker
-                    self._speaker = Speaker()
-                self._speaker.speak(random.choice(_QUIPS))
-            except Exception as exc:  # never let TTS crash the app
-                print(f"[marvin] speak failed: {exc!r}", flush=True)
-            finally:
-                self._speaking = False
+            with self._speak_lock:  # answers queue behind a quip instead of dropping
+                try:
+                    self._speaker.speak(text)
+                except Exception as exc:  # never let TTS crash the app
+                    print(f"[marvin] speak failed: {exc!r}", flush=True)
 
         import threading
         threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_ask_enabled(self, enabled):
+        self.engine.set_ask_enabled(enabled)
+        if getattr(self, "_ask_item", None) is not None:
+            self._ask_item.state = 1 if enabled else 0
+        self._save_config()
+
+    def _apply_ask_voice(self, enabled):
+        self.config.setdefault("ask", {})["voice"] = enabled
+        if getattr(self, "_ask_voice_item", None) is not None:
+            self._ask_voice_item.state = 1 if enabled else 0
+        self._save_config()
+
+    def _toggle_ask(self, _sender):
+        self._apply_ask_enabled(not self.config.get("ask", {}).get("enabled", True))
+
+    def _toggle_ask_voice(self, _sender):
+        self._apply_ask_voice(not self.config.get("ask", {}).get("voice", True))
+
+    def _ask_prompt(self):
+        """Typed tester: ask Marvin a question without using the mic. Routes
+        through the engine's ask handler so the answer/fallback/present logic
+        is shared with the spoken path (no second copy to drift)."""
+        resp = rumps.Window(
+            message="Ask Marvin a question:",
+            title="Ask Marvin", default_text="", ok="Ask", cancel="Cancel",
+            dimensions=(320, 60),
+        ).run()
+        q = resp.text.strip()
+        if not (resp.clicked and q):
+            return
+        import threading
+        threading.Thread(
+            target=lambda: self.engine._handle_ask(q), daemon=True
+        ).start()
 
     def _toggle_cleanup(self, _sender):
         self._apply_cleanup(not self.config["cleanup"].get("enabled", True))
@@ -454,6 +612,16 @@ class MenuBarApp(rumps.App):
         add("Double-click to talk", lambda: self._apply_talk(not talk_on), menu,
             state=talk_on)
         add("Say something", lambda: self._marvin_speak(force=True), menu)
+
+        # Ask Marvin (speak a question, he answers)
+        ask_on = self.config.get("ask", {}).get("enabled", True)
+        ask_voice = self.config.get("ask", {}).get("voice", True)
+        ask_binding = self.config.get("hotkey", {}).get("ask", "control + shift + a")
+        add(f"Ask Marvin  ({ask_binding})",
+            lambda: self._apply_ask_enabled(not ask_on), menu, state=ask_on)
+        add("Speak answers", lambda: self._apply_ask_voice(not ask_voice), menu,
+            state=ask_voice)
+        add("Ask Marvin…", lambda: self._ask_prompt(), menu)
 
         cleanup_on = self.config["cleanup"].get("enabled", True)
         add("AI cleanup", lambda: self._apply_cleanup(not cleanup_on), menu,

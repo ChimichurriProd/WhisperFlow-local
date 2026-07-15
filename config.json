@@ -17,7 +17,14 @@
   },
   "hotkey": {
     "push_to_talk": "control + shift + space",
+    "ask": "control + shift + a",
     "mode": "hold"
+  },
+  "ask": {
+    "enabled": true,
+    "voice": true,
+    "timeout_seconds": 60,
+    "temperature": 0.5
   },
   "injection": {
     "delivery_method": "clipboard",

@@ -89,6 +89,120 @@ def test_cleanup_disabled_is_verbatim(config):
     assert result == "um i use Ollama and it stays exactly like this"  # verbatim + fix
 
 
+# --------------------------------------------------------------- ask Marvin
+
+def test_answer_question_calls_ollama(config):
+    from app import answer, ollama
+
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "  42, obviously.  "}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return FakeResp()
+
+    with patch.object(ollama.requests, "post", side_effect=fake_post):
+        out = answer.answer_question("what is the meaning of life", config)
+
+    assert out == "42, obviously."  # stripped
+    # ask.ollama_model defaults to None -> inherits the cleanup model.
+    assert captured["json"]["model"] == config["cleanup"]["ollama_model"]
+    assert captured["json"]["system"] == answer.ANSWER_SYSTEM
+    assert captured["json"]["prompt"] == "what is the meaning of life"
+    assert captured["json"]["stream"] is False
+    assert captured["timeout"] == config["ask"]["timeout_seconds"]
+
+
+def test_answer_question_empty_is_noop(config):
+    from app import answer, ollama
+
+    with patch.object(ollama.requests, "post") as post:
+        assert answer.answer_question("   ", config) == ""
+    post.assert_not_called()
+
+
+def test_answer_falls_back_to_cleanup_endpoint():
+    """With no explicit ask url/model, it reuses the cleanup Ollama settings."""
+    from app import answer, ollama
+
+    cfg = {
+        "cleanup": {"ollama_url": "http://host:9/", "ollama_model": "m2",
+                    "keep_alive": "30m"},
+        "ask": {},  # no url/model override
+    }
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "ok"}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        return FakeResp()
+
+    with patch.object(ollama.requests, "post", side_effect=fake_post):
+        answer.answer_question("hi", cfg)
+    assert captured["url"] == "http://host:9/api/generate"  # trailing slash trimmed
+    assert captured["json"]["model"] == "m2"
+
+
+def test_ollama_generate_raises_on_error_body():
+    """A 200 response carrying an Ollama {"error": ...} body must raise (not
+    silently return ''), so callers can tell 'server said no' from success."""
+    from app import ollama
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"error": "model 'nope' not found"}
+
+    with patch.object(ollama.requests, "post", return_value=FakeResp()):
+        with pytest.raises(RuntimeError):
+            ollama.generate("hi", url="http://x", model="nope")
+
+
+def test_ollama_generate_missing_response_is_empty():
+    """A 200 body without 'response' returns '' rather than raising KeyError."""
+    from app import ollama
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"done": True}
+
+    with patch.object(ollama.requests, "post", return_value=FakeResp()):
+        assert ollama.generate("hi", url="http://x", model="m") == ""
+
+
+def test_resolve_trigger_vk_letter_uses_ansi_fallback():
+    from app.hotkey import parse_hotkey, resolve_trigger_vk, split_combo
+
+    # split_combo can't resolve a letter trigger to a keycode...
+    _, plain = split_combo(parse_hotkey("control + shift + a"))
+    assert plain is None
+    # ...but resolve_trigger_vk fills it via the ANSI map (A = keycode 0).
+    modifiers, vk = resolve_trigger_vk(parse_hotkey("control + shift + a"))
+    assert vk == 0
+    from pynput.keyboard import Key
+    assert modifiers == frozenset({Key.ctrl, Key.shift})
+
+
 def test_ollama_clean_sends_temperature_zero(config):
     import app.cleanup as cl
 
@@ -127,6 +241,9 @@ def test_setting_changes_dont_crash():
     eng.set_language(None)
     eng.set_model("small")
     eng.reload_vocabulary()
+    eng.set_ask_enabled(False)        # ask-Marvin toggles: also no rebuild
+    eng.set_ask_enabled(True)
+    eng.set_ask_hotkey("control + shift + q")
 
 
 def test_sound_cues_respect_toggle():
@@ -240,3 +357,85 @@ def test_split_combo_resolves_trigger_keycode():
     # Char triggers can't be resolved to a keycode -> suppression disabled.
     _, char_vk = split_combo(parse_hotkey("cmd + d"))
     assert char_vk is None
+
+
+# --------------------------------------------- two-faced Marvin (front/back)
+
+def test_ease_toward_converges_without_overshoot():
+    from app.pill import _TURN_BACK, _TURN_SPEED, _ease_toward
+
+    # front (0) -> back (_TURN_BACK): reaches it exactly, never overshoots,
+    # in roughly one second at 20 Hz.
+    f, ticks = 0.0, 0
+    while f < _TURN_BACK:
+        f = _ease_toward(f, float(_TURN_BACK), _TURN_SPEED)
+        ticks += 1
+        assert f <= _TURN_BACK
+        assert ticks < 1000  # can't loop forever
+    assert f == float(_TURN_BACK)
+    assert ticks == pytest.approx(_TURN_BACK / _TURN_SPEED, abs=1)  # ~20 ticks
+
+    # back -> front returns exactly to 0 (no undershoot past it).
+    while f > 0.0:
+        f = _ease_toward(f, 0.0, _TURN_SPEED)
+        assert f >= 0.0
+    assert f == 0.0
+
+
+def _pill_turn_stub():
+    """Bind the real _Pill.face_back/face_front to a bare stub so the pure turn
+    logic runs without building an AppKit window. Skips if AppKit is absent."""
+    from app import pill as P
+
+    Pill = getattr(P, "_Pill", None)
+    if Pill is None:
+        pytest.skip("AppKit unavailable: _Pill not defined")
+
+    class Stub:
+        pass
+
+    s = Stub()
+    s.back = object()               # a back face is present
+    s.clips = {"spin": [0] * 120}   # a turnaround exists -> animate the turn
+    s._turn_f = 0.0
+    s._face_target = 0.0
+    s.face_back = Pill.face_back.__get__(s)
+    s.face_front = Pill.face_front.__get__(s)
+    return s, P
+
+
+def test_face_back_and_front_set_target():
+    s, P = _pill_turn_stub()
+    s.face_back()
+    assert s._face_target == float(P._TURN_BACK)  # turning to the oracle
+    assert s._turn_f == 0.0                        # but not snapped (animates)
+    s.face_front()
+    assert s._face_target == 0.0                   # turning back to the scribe
+
+
+def test_face_back_snaps_when_no_turnaround():
+    s, P = _pill_turn_stub()
+    s.clips = {}                     # no spin frames to animate with
+    s.face_back()
+    assert s._turn_f == float(P._TURN_BACK)  # snaps straight to the back face
+
+
+def test_face_back_is_noop_without_back_face():
+    s, _ = _pill_turn_stub()
+    s.back = None                    # nothing to turn to
+    s.face_back()
+    assert s._face_target == 0.0     # stays facing front
+
+
+def test_ask_start_signal_fires_for_ask_only():
+    from app.config import load_config as _lc
+    from app.hotkey import PushToTalkApp
+
+    fired = []
+    eng = PushToTalkApp(_lc(), on_ask_start=lambda: fired.append("ask"))
+    with patch.object(eng, "on_press"):   # don't actually open the mic
+        eng._start_recording("ask")
+        assert fired == ["ask"]           # ask begins -> Marvin should turn
+        eng._active = False               # let another recording start
+        eng._start_recording("dictate")
+        assert fired == ["ask"]           # dictation must NOT fire the turn

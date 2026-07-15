@@ -23,7 +23,20 @@ DEFAULTS = {
     },
     "hotkey": {
         "push_to_talk": "control + shift + space",
+        "ask": "control + shift + a",  # hold to ask Marvin a question (see "ask")
         "mode": "hold",  # "hold" = push-to-talk | "toggle" = tap on/off
+    },
+    "ask": {
+        # Hold the ask hotkey, speak a question -> the local LLM answers in a
+        # bubble (and aloud when "voice" is on and the answer is English).
+        "enabled": True,
+        # None -> reuse cleanup.ollama_model, so both paths keep ONE model
+        # resident (a distinct model would make Ollama cold-reload on each
+        # dictation<->ask switch). Set a string here only to override.
+        "ollama_model": None,
+        "voice": True,                  # speak English answers (Kokoro TTS)
+        "timeout_seconds": 60,          # answers can be longer than cleanup
+        "temperature": 0.5,             # a little warmth vs cleanup's 0.0
     },
     "injection": {
         "delivery_method": "clipboard",  # "clipboard" | "type"

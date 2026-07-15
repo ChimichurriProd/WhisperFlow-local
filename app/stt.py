@@ -50,6 +50,9 @@ class Transcriber:
         self._fw_model = None  # faster-whisper instance (lazy)
         self._mlx_pool = None  # single-thread executor for MLX (lazy)
         self._mlx_fails = 0    # consecutive MLX failures -> auto-disable
+        self.last_language = None  # language of the most recent transcription
+                                   # (forced language, else what STT detected) —
+                                   # lets the ask flow skip TTS for non-English.
 
     def transcribe(self, audio):
         """audio: 1-D float32 at 16 kHz. Returns the joined transcript string."""
@@ -99,6 +102,7 @@ class Transcriber:
             opts["language"] = self.language
         result = mlx_whisper.transcribe(audio, **opts)
         text = (result.get("text") or "").strip()
+        self.last_language = self.language or result.get("language")
         if self.language is None and text:
             print(f"[stt] detected language: {result.get('language')}", flush=True)
         return text
@@ -123,6 +127,7 @@ class Transcriber:
             initial_prompt=self.initial_prompt,
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
+        self.last_language = self.language or info.language
         if self.language is None and text:
             print(f"[stt] detected language: {info.language} "
                   f"(p={info.language_probability:.2f})", flush=True)

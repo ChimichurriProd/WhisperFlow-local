@@ -30,6 +30,29 @@ _MARVIN_INSET = 0.386  # normal head ~58px in the window
 _SS_CLIP = "super_saiyan"
 _SS_INSET = 0.114
 
+# Two-faced Marvin: a second "oracle" persona lives on the BACK of his head
+# (cyan lens eyes, assets/marvin/back.png). While dictating he faces you as the
+# green-eyed "scribe"; when he answers a question he physically turns around to
+# reveal the oracle, then turns back when he's done. The turn reuses the spin
+# turnaround frames: index 0 = front, _TURN_BACK = full back (180°).
+_TURN_BACK = 60        # spin frame index showing the full back of the head
+_TURN_SPEED = 3.0      # spin frames advanced per 20 Hz tick (~1.0 s per half-turn)
+# Cyan eye centres on the back face (normalized to the drawn head, y from top) —
+# same position as the front eyes, so it reads as the same head's other face.
+_BACK_EYES = ((0.505 - 0.174, 0.545), (0.505 + 0.174, 0.545))
+_BACK_EYE_RGB = (0.37, 0.88, 1.0)   # cyan bloom for the oracle's voice glow
+
+
+def _ease_toward(cur, target, speed):
+    """Step *cur* toward *target* by at most *speed* (never overshoots). Used to
+    animate the front/back persona turn one 20 Hz tick at a time. Defined at
+    module scope (outside the AppKit import) so it's testable headlessly."""
+    if cur < target:
+        return min(target, cur + speed)
+    if cur > target:
+        return max(target, cur - speed)
+    return cur
+
 # Per-STT-model idle loop clips: when assets/marvin/<clip>/ exists for the
 # active model, Marvin's resting loop plays it (largest model = electric,
 # smallest = sleepy) so you can tell at a glance which model is loaded.
@@ -123,6 +146,13 @@ try:
         from pathlib import Path
 
         p = Path(__file__).resolve().parent.parent / "assets" / "marvin" / "center.png"
+        return NSImage.alloc().initWithContentsOfFile_(str(p)) if p.exists() else None
+
+    def _load_marvin_back():
+        """Load the back-of-head 'oracle' face (back.png), shown while answering."""
+        from pathlib import Path
+
+        p = Path(__file__).resolve().parent.parent / "assets" / "marvin" / "back.png"
         return NSImage.alloc().initWithContentsOfFile_(str(p)) if p.exists() else None
 
     def _load_marvin_clips():
@@ -333,6 +363,11 @@ try:
             """Draw one Marvin frame (the current flipbook frame while a clip is
             active, else the still centre pose) and, while dictating, add a
             voice-reactive green bloom over the frame's eyes."""
+            # Turned toward the back 'oracle' persona: draw the turnaround / back
+            # face instead of the front clips.
+            if c._turn_f > 0.5:
+                self._draw_marvin_back(c, w, h)
+                return
             shown = (c._oneshot if (c._oneshot and c._oneshot in c.clips)
                      else c._active_clip_name(c.mode))
             # super_saiyan: draw at a fixed larger rect so the head == idle size while the aura
@@ -372,9 +407,42 @@ try:
                     NSGraphicsContext.restoreGraphicsState()
 
         @objc.python_method
-        def _eye_glow(self, rx, ry, rw, rh, eyes, glow):
-            """Soft feathered green bloom over each eye (stacked radial gradients
-            so it fades gradually), scaled by loudness."""
+        def _draw_marvin_back(self, c, w, h):
+            """Draw the back 'oracle' persona: the rotating turnaround frame while
+            he's mid-turn, and the cyan-eyed back face once settled (with a
+            voice-reactive cyan bloom while he's listening to a question)."""
+            m = w * _MARVIN_INSET
+            rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
+            rect = NSMakeRect(rx, ry, rw, rh)
+
+            spin = c.clips.get("spin")
+            settled = c._turn_f >= _TURN_BACK - 0.5
+            if settled and c.back is not None:
+                c.back.drawInRect_(rect)                 # back face + cyan eyes
+            elif spin:
+                fi = max(0, min(len(spin) - 1, int(round(c._turn_f))))
+                spin[fi].drawInRect_(rect)               # mid-turn (no face yet)
+            elif c.back is not None:
+                c.back.drawInRect_(rect)                 # no turnaround: just snap
+            else:
+                return
+
+            level = c.levels[-1] if c.levels else 0.0
+            if settled and c.mode == "recording" and level > 0.05:
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect(w * 0.02, h * 0.02, w * 0.96, h * 0.96)
+                ).addClip()
+                self._eye_glow(rx, ry, rw, rh, _BACK_EYES, level,
+                               rgb=_BACK_EYE_RGB)
+                NSGraphicsContext.restoreGraphicsState()
+
+        @objc.python_method
+        def _eye_glow(self, rx, ry, rw, rh, eyes, glow, rgb=(0.60, 1.0, 0.45)):
+            """Soft feathered bloom over each eye (stacked radial gradients so it
+            fades gradually), scaled by loudness. Green for the front scribe,
+            cyan for the back oracle (via *rgb*)."""
+            r, g, b = rgb
             core = min(0.65, glow * 0.85)
             for nx, ny in eyes:
                 gx, gy = rx + nx * rw, ry + ny * rh
@@ -382,8 +450,8 @@ try:
                                      (0.24, core * 0.25)):
                     rad = rw * scale * (1.0 + glow * 0.4)
                     grad = NSGradient.alloc().initWithColors_([
-                        _rgb(0.60, 1.0, 0.45, alpha),
-                        _rgb(0.60, 1.0, 0.45, 0.0),
+                        _rgb(r, g, b, alpha),
+                        _rgb(r, g, b, 0.0),
                     ])
                     path = NSBezierPath.bezierPathWithOvalInRect_(
                         NSMakeRect(gx - rad, gy - rad, 2 * rad, 2 * rad)
@@ -502,6 +570,7 @@ try:
             self.model = "small"
             self.hover = False
             self.center = _load_marvin_center() if style == "marvin" else None
+            self.back = _load_marvin_back() if style == "marvin" else None
             self.clips, self.clip_eyes = (
                 _load_marvin_clips() if style == "marvin" else ({}, {})
             )
@@ -516,6 +585,11 @@ try:
             self._prev_mode = "idle"
             self._oneshot = None       # a gesture clip playing once (wake/spin/react)
             self._oneshot_f = 0.0
+            # Front/back persona turn: _turn_f is the current facing in spin-frame
+            # units (0 = front scribe, _TURN_BACK = back oracle); _face_target is
+            # where he's turning to. Equal => settled.
+            self._turn_f = 0.0
+            self._face_target = 0.0
             # Idle micro-gestures: the subset of _IDLE_GESTURE_CLIPS actually
             # present, one played at random every ~15-35s (20 ticks/sec) so
             # Marvin reads as alive rather than frozen while resting.
@@ -638,6 +712,23 @@ try:
             self.tilt += (target - self.tilt) * 0.25
             self.nod += (nod_target - self.nod) * 0.25
 
+            # Turn between the front (scribe) and back (oracle) personas: ease
+            # _turn_f toward the target facing. >0.5 means his back face shows.
+            self._turn_f = _ease_toward(self._turn_f, self._face_target, _TURN_SPEED)
+
+            if self._turn_f > 0.5:
+                # The oracle owns the whole display while he's turned around;
+                # suppress the front scribe's gestures/clips so nothing is left
+                # mid-play when he turns back to face you.
+                self._oneshot = None
+                self._clip_f = 0.0
+                self._clip_dir = 1
+                self._idle_gesture_t = random.randint(300, 700)
+                self._prev_mode = mode
+                self._render()
+                return
+
+            # ------- front (scribe) persona -------
             # Mode transitions trigger one-shot gestures.
             if mode == "recording" and self._prev_mode != "recording":
                 order = [n for n in ("alert", "shake", "nod") if n in self.clips]
@@ -695,6 +786,21 @@ try:
             if name in self.clips:
                 self._oneshot = name
                 self._oneshot_f = 0.0
+
+        def face_back(self):
+            """Turn to the back 'oracle' persona (while answering a question).
+            No-op if there's no back face to show."""
+            if self.back is None:
+                return
+            self._face_target = float(_TURN_BACK)
+            if "spin" not in self.clips:   # no turnaround frames -> snap around
+                self._turn_f = float(_TURN_BACK)
+
+        def face_front(self):
+            """Turn back to the front 'scribe' persona (dictation / resting)."""
+            self._face_target = 0.0
+            if "spin" not in self.clips:
+                self._turn_f = 0.0
 
         def play_all(self):
             """Showcase: play every gesture once, back to back."""

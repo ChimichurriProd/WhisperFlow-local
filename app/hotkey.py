@@ -21,6 +21,15 @@ from .injection import inject_text
 from .sound import play_done, play_start
 from .stt import Transcriber, build_initial_prompt
 
+# What Marvin "says" when the ask pipeline can't produce an answer — in
+# character, so a failure still feels like Marvin rather than an error dialog.
+# Covers both a down server and an Ollama error body (e.g. model not pulled);
+# the real cause is in the log, so the spoken line stays deliberately vague.
+_ASK_UNREACHABLE = (
+    "Something went wrong reaching my brain. Is Ollama running, with the "
+    "model pulled? Predictably grim.")
+_ASK_EMPTY = "I have nothing to say. For once, that's honest rather than rude."
+
 
 def parse_hotkey(spec):
     """Parse "control + shift + space" into a frozenset of canonical pynput keys."""
@@ -94,9 +103,44 @@ def split_combo(required):
     return modifiers, vk
 
 
+# US / most-Latin-layout ANSI virtual keycodes for letters + digits. pynput's
+# KeyCode.from_char(c).vk is None on macOS (it does no layout lookup), so
+# split_combo can't suppress a letter trigger. These fill that gap: the letter
+# *positions* (and thus keycodes) are identical on Swedish and most Latin
+# layouts, so Ctrl+Shift+A resolves correctly here too.
+_ANSI_VK = {
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8,
+    "v": 9, "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+    "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40, "n": 45,
+    "m": 46, "1": 18, "2": 19, "3": 20, "4": 21, "5": 23, "6": 22, "7": 26,
+    "8": 28, "9": 25, "0": 29,
+}
+
+
+def resolve_trigger_vk(required):
+    """Like split_combo, but with an ANSI fallback so a single letter/digit
+    trigger still gets a virtual keycode (needed to suppress it at the event
+    tap). Returns (modifiers, vk-or-None)."""
+    from pynput.keyboard import KeyCode
+
+    modifiers, vk = split_combo(required)
+    if vk is None:
+        chars = [k for k in required if isinstance(k, KeyCode) and k.char]
+        if len(chars) == 1:
+            vk = _ANSI_VK.get(chars[0].char.lower())
+    return modifiers, vk
+
+
 class PushToTalkApp:
-    def __init__(self, config, on_status=None):
+    def __init__(self, config, on_status=None, on_answer=None, on_ask_start=None):
         self.config = config
+        # on_answer(question, answer) — the UI presents Marvin's reply (speech
+        # bubble + optional TTS). None -> just print it.
+        self._on_answer = on_answer
+        # on_ask_start() — fired the moment an ask recording begins, so the UI
+        # can react early (Marvin turns to his 'oracle' back face for the whole
+        # question, not just once the answer lands).
+        self._on_ask_start = on_ask_start
         self.recorder = Recorder(
             sample_rate=config["audio"]["sample_rate"],
             channels=config["audio"]["channels"],
@@ -112,6 +156,7 @@ class PushToTalkApp:
         self._pressed = set()  # currently-held keys, maintained by the listener
         self._on_status = on_status  # callable(state: str), e.g. menu-bar icon
         self._active = False           # currently recording
+        self._active_kind = "dictate"  # "dictate" | "ask" — which pipeline this rec feeds
         self._trigger_vk = None        # set by build_listener
         self._rec_start = 0.0
         self._state_lock = threading.Lock()
@@ -124,8 +169,22 @@ class PushToTalkApp:
         self._rmod = None
         self._intercept_vk = None
         self._rmod_flag = None
+        # The trigger of the CURRENTLY-active recording, so the watchdog polls the
+        # right key whether it was started by the dictate or the ask hotkey.
+        self._active_trigger_vk = None
+        self._active_rmod_flag = None
+        # Second hotkey: "ask Marvin". Same recorder + STT, different last stage
+        # (LLM answer + speak) — see on_release. Always a modifier+trigger combo
+        # (no right-modifier support), so one keycode covers intercept + watchdog.
+        self._ask_required = frozenset()
+        self._ask_modifiers = frozenset()
+        self._ask_vk = None
+        self._ask_on = config.get("ask", {}).get("enabled", True)
         self._paused = False
         self._set_hotkey_params(config["hotkey"]["push_to_talk"])
+        self._set_ask_hotkey_params(
+            config.get("hotkey", {}).get("ask", "control + shift + a")
+        )
         threading.Thread(target=self._watchdog, daemon=True).start()
 
     def set_paused(self, paused):
@@ -157,7 +216,10 @@ class PushToTalkApp:
         from pynput.keyboard import Key
 
         required = parse_hotkey(binding)
-        modifiers, trigger_vk = split_combo(required)
+        # resolve_trigger_vk (not split_combo) so a single-letter dictate
+        # trigger also gets a keycode and is suppressed at the event tap
+        # instead of leaking the letter into the focused app.
+        modifiers, trigger_vk = resolve_trigger_vk(required)
         rmods = {Key.cmd_r, Key.alt_r, Key.ctrl_r, Key.shift_r}
         rmod = next(iter(required)) if (
             len(required) == 1 and next(iter(required)) in rmods) else None
@@ -184,16 +246,56 @@ class PushToTalkApp:
         self._set_hotkey_params(binding)
         print(f"Hotkey changed to [{binding}]", flush=True)
 
+    def _set_ask_hotkey_params(self, binding):
+        """Parse the ask-Marvin binding into live matching params (a plain
+        modifier+trigger combo — no right-modifier / toggle-flag polling)."""
+        required = parse_hotkey(binding)
+        modifiers, vk = resolve_trigger_vk(required)
+        self._ask_required = required
+        self._ask_modifiers = modifiers
+        self._ask_vk = vk  # matches at the event tap AND feeds the watchdog
+        if vk is None:
+            # No resolvable keycode -> the intercept can't route it. Rather than
+            # a silent no-op, say so (all letter/digit triggers resolve fine).
+            print(f"[hotkey] ask hotkey [{binding}] has no keycode — pick a "
+                  "letter/digit trigger so it can be captured.", flush=True)
+
+    def set_ask_hotkey(self, binding):
+        """Change the ask-Marvin hotkey live (no listener rebuild)."""
+        self.config.setdefault("hotkey", {})["ask"] = binding
+        self._set_ask_hotkey_params(binding)
+        print(f"Ask hotkey changed to [{binding}]", flush=True)
+
+    def set_ask_enabled(self, enabled):
+        """Turn the ask-Marvin hotkey on/off. When off, the combo types
+        normally (no suppression, no recording)."""
+        self._ask_on = bool(enabled)
+        self.config.setdefault("ask", {})["enabled"] = self._ask_on
+
     def _status(self, state):
         if self._on_status is not None:
             self._on_status(state)
 
-    def _start_recording(self):
+    def _start_recording(self, kind="dictate"):
         with self._state_lock:
             if self._active or self._paused:
                 return
             self._active = True
+            self._active_kind = kind
+            # Tell the watchdog which key to poll for release (dictate vs ask).
+            if kind == "ask":
+                self._active_trigger_vk = self._ask_vk
+                self._active_rmod_flag = None
+            else:
+                self._active_trigger_vk = self._trigger_vk
+                self._active_rmod_flag = self._rmod_flag
             self._rec_start = time.monotonic()
+        # Signal the UI that an ask episode has begun (Marvin turns around).
+        if kind == "ask" and self._on_ask_start is not None:
+            try:
+                self._on_ask_start()
+            except Exception as exc:
+                print(f"[ask] on_ask_start failed: {exc!r}", flush=True)
         self.on_press()
 
     def _stop_recording(self, reason=""):
@@ -201,9 +303,12 @@ class PushToTalkApp:
             if not self._active:
                 return
             self._active = False
+            kind = self._active_kind
         if reason:
             print(f"[rec] stop ({reason})", flush=True)
-        threading.Thread(target=self.on_release, daemon=True).start()
+        threading.Thread(
+            target=self.on_release, args=(kind,), daemon=True
+        ).start()
 
     def _watchdog(self):
         """Safety net, twice over:
@@ -230,14 +335,14 @@ class PushToTalkApp:
                     # release event was missed — stop. (Toggle mode: the key is
                     # up on purpose, so this whole block is skipped.)
                     released = False
-                    if self._rmod_flag is not None:  # modifier: check the flag
+                    if self._active_rmod_flag is not None:  # modifier: check flag
                         flags = Quartz.CGEventSourceFlagsState(
                             Quartz.kCGEventSourceStateHIDSystemState)
-                        released = not (int(flags) & self._rmod_flag)
-                    elif self._trigger_vk is not None:  # real key: check keycode
+                        released = not (int(flags) & self._active_rmod_flag)
+                    elif self._active_trigger_vk is not None:  # real key: keycode
                         released = not Quartz.CGEventSourceKeyState(
                             Quartz.kCGEventSourceStateHIDSystemState,
-                            self._trigger_vk)
+                            self._active_trigger_vk)
                     if released:
                         self._stop_recording("watchdog: key released")
                         continue
@@ -293,7 +398,7 @@ class PushToTalkApp:
             self._active = False
             self._status("idle")
 
-    def on_release(self):
+    def on_release(self, kind="dictate"):
         with self._busy:
             try:
                 audio = self.recorder.stop()
@@ -302,6 +407,8 @@ class PushToTalkApp:
                 # would leave the app stuck in "record" for good).
                 print(f"[rec] recorder stop failed: {exc!r}", flush=True)
                 audio = None
+            # "transcribing" doubles as the busy/thinking indicator for both
+            # pipelines (STT, and for ask, the LLM answer too).
             self._status("transcribing")
             try:
                 if audio is None or len(audio) == 0:
@@ -312,6 +419,9 @@ class PushToTalkApp:
                 raw = self.transcriber.transcribe(audio)
                 if not raw:
                     print("[stt] (nothing recognized)", flush=True)
+                    return
+                if kind == "ask":
+                    self._handle_ask(raw)
                     return
                 cleaned = clean_transcript(raw, self.config)
                 if not cleaned:
@@ -327,6 +437,60 @@ class PushToTalkApp:
             finally:
                 self._status("idle")
 
+    def _handle_ask(self, question):
+        """Ask-Marvin last stage: send the transcribed question to the local LLM
+        and hand the answer to the UI (bubble + optional speech)."""
+        from .answer import answer_question
+
+        lang = getattr(self.transcriber, "last_language", None)
+        print(f'[ask] question ({lang}): "{question}"', flush=True)
+        try:
+            answer = answer_question(question, self.config)
+        except Exception as exc:
+            print(f"[ask] answer failed: {exc!r}", flush=True)
+            answer = _ASK_UNREACHABLE
+        if not answer:
+            answer = _ASK_EMPTY
+        print(f'[ask] answer: "{answer}"', flush=True)
+        if self._on_answer is not None:
+            try:
+                self._on_answer(question, answer)
+            except Exception as exc:
+                print(f"[ask] present failed: {exc!r}", flush=True)
+
+    def _intercept_trigger(self, event_type, event, kind, modifiers):
+        """Event-tap handler for one hotkey's trigger key (dictate or ask).
+        Returns the event to pass it through, or None to swallow it so the
+        focused app never sees the keystroke."""
+        import Quartz
+
+        if kind == "ask" and not self._ask_on:
+            return event  # feature off: let the combo type normally
+        if event_type == Quartz.kCGEventKeyDown:
+            if self._toggle:
+                if self._active:
+                    # Any hotkey press ends the current toggle recording. Same
+                    # kind = the natural stop; the other kind stops it too (then
+                    # a second press starts that mode) so the key is never
+                    # swallowed with nothing happening.
+                    self._stop_recording()
+                    return None
+                if modifiers <= self._pressed:
+                    self._start_recording(kind)
+                    return None
+                return event
+            if self._active:
+                return None  # key-repeat (or the other combo) while recording
+            if modifiers <= self._pressed:
+                self._start_recording(kind)
+                return None
+            return event  # trigger without the modifiers: normal typing
+        # keyUp: end a hold-mode recording only if THIS hotkey started it.
+        if not self._toggle and self._active and self._active_kind == kind:
+            self._stop_recording()
+            return None
+        return event
+
     def build_listener(self):
         """Create (but don't start) the global hotkey listener."""
         if sys.platform != "darwin":
@@ -340,70 +504,67 @@ class PushToTalkApp:
         pressed = self._pressed  # shared with _wait_hotkey_released
 
         def intercept(event_type, event):
-            """Swallow the trigger key at the event tap so the focused app never
-            receives it. Reads the live hotkey params so the hotkey can change
-            without rebuilding the listener."""
-            tvk = self._intercept_vk
-            if tvk is None:
-                return event
+            """Swallow a hotkey's trigger key at the event tap so the focused
+            app never receives it. Reads the live hotkey params so a hotkey can
+            change without rebuilding the listener. Handles both the dictate and
+            the ask trigger (matched by virtual keycode)."""
             if event_type not in (Quartz.kCGEventKeyDown, Quartz.kCGEventKeyUp):
                 return event
             vk = Quartz.CGEventGetIntegerValueField(
                 event, Quartz.kCGKeyboardEventKeycode
             )
-            if vk != tvk:
-                return event
-            if event_type == Quartz.kCGEventKeyDown:
-                if self._toggle:
-                    if self._active:
-                        self._stop_recording()
-                        return None
-                    if self._modifiers <= pressed:
-                        self._start_recording()
-                        return None
-                    return event
-                if self._active:
-                    return None  # key-repeat while recording: just swallow
-                if self._modifiers <= pressed:
-                    self._start_recording()
-                    return None
-                return event  # trigger key without the modifiers: normal typing
-            if not self._toggle and self._active:  # keyUp ends hold-mode dictation
-                self._stop_recording()
-                return None
+            if self._intercept_vk is not None and vk == self._intercept_vk:
+                return self._intercept_trigger(
+                    event_type, event, "dictate", self._modifiers)
+            if self._ask_vk is not None and vk == self._ask_vk:
+                return self._intercept_trigger(
+                    event_type, event, "ask", self._ask_modifiers)
             return event
 
         def on_press(key):
+            # Always track held keys, even for a right-modifier dictate hotkey:
+            # the ask combo's modifier check (in the intercept) reads this set.
+            pressed.add(canonicalize(key))
             rmod = self._rmod
-            if rmod is not None:  # single right-modifier: match the raw key
+            if rmod is not None:  # single right-modifier dictate: match raw key
                 if key == rmod:
                     if self._toggle:
                         (self._stop_recording if self._active
-                         else self._start_recording)()
+                         else self._start_recording)("dictate")
                     elif not self._active:
-                        self._start_recording()
-                return
-            pressed.add(canonicalize(key))
-            if self._intercept_vk is None and self._required <= pressed:
+                        self._start_recording("dictate")
+            elif self._intercept_vk is None and self._required <= pressed:
+                # A dictate hotkey with no keycode (exotic trigger) can't be
+                # suppressed, so match it here instead. Both hotkeys with a
+                # keycode go through the event-tap intercept, not this path.
                 if self._toggle:
                     (self._stop_recording if self._active
-                     else self._start_recording)()
+                     else self._start_recording)("dictate")
                 elif not self._active:
-                    self._start_recording()
+                    self._start_recording("dictate")
 
         def on_release(key):
-            rmod = self._rmod
-            if rmod is not None:
-                if key == rmod and not self._toggle and self._active:
-                    self._stop_recording()
-                return
             k = canonicalize(key)
             pressed.discard(k)
-            if not self._toggle and self._active and k in self._required:
-                self._stop_recording()
+            rmod = self._rmod
+            if rmod is not None and key == rmod:
+                if not self._toggle and self._active:
+                    self._stop_recording()
+                return
+            # Releasing any key of the CURRENTLY-active combo ends a hold-mode
+            # recording (idempotent: the intercept keyUp may have stopped it
+            # already). Keyed to the active kind so the two hotkeys don't cross.
+            if not self._toggle and self._active:
+                combo = (self._ask_required if self._active_kind == "ask"
+                         else self._required)
+                if k in combo:
+                    self._stop_recording()
 
         print(f"Ready. Hold [{self.config['hotkey']['push_to_talk']}] "
               "to dictate.", flush=True)
+        if self._ask_on:
+            print(f"Hold [{self.config.get('hotkey', {}).get('ask', 'control + shift + a')}] "
+                  "to ask Marvin a question.", flush=True)
         print("(If nothing happens, grant Input Monitoring and Accessibility "
               "in System Settings -> Privacy & Security.)", flush=True)
         listener = keyboard.Listener(
