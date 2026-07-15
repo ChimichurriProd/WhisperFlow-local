@@ -37,6 +37,7 @@ DEFAULTS = {
         "voice": True,                  # speak English answers (Kokoro TTS)
         "timeout_seconds": 60,          # answers can be longer than cleanup
         "temperature": 0.5,             # a little warmth vs cleanup's 0.0
+        "num_predict": 220,             # token cap: a backstop on reply length
     },
     "injection": {
         "delivery_method": "clipboard",  # "clipboard" | "type"

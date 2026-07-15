@@ -290,12 +290,17 @@ class PushToTalkApp:
                 self._active_trigger_vk = self._trigger_vk
                 self._active_rmod_flag = self._rmod_flag
             self._rec_start = time.monotonic()
-        # Signal the UI that an ask episode has begun (Marvin turns around).
-        if kind == "ask" and self._on_ask_start is not None:
-            try:
-                self._on_ask_start()
-            except Exception as exc:
-                print(f"[ask] on_ask_start failed: {exc!r}", flush=True)
+        if kind == "ask":
+            # Signal the UI that an ask episode has begun (Marvin turns around).
+            if self._on_ask_start is not None:
+                try:
+                    self._on_ask_start()
+                except Exception as exc:
+                    print(f"[ask] on_ask_start failed: {exc!r}", flush=True)
+            # Preload the LLM now, overlapping the model load with the seconds
+            # the user spends actually speaking — so answering feels instant
+            # even on the first ask after Ollama has idled the model out.
+            threading.Thread(target=self._warm_ask_model, daemon=True).start()
         self.on_press()
 
     def _stop_recording(self, reason=""):
@@ -436,6 +441,18 @@ class PushToTalkApp:
                 play_done(self.config)
             finally:
                 self._status("idle")
+
+    def _warm_ask_model(self):
+        """Best-effort preload of the answer model (called at ask-record start)."""
+        from . import ollama
+
+        ask = self.config.get("ask", {})
+        clean = self.config.get("cleanup", {})
+        url = ask.get("ollama_url") or clean.get("ollama_url",
+                                                 "http://localhost:11434")
+        model = ask.get("ollama_model") or clean.get("ollama_model",
+                                                      "llama3.1:8b")
+        ollama.warm(url, model, keep_alive=clean.get("keep_alive", "30m"))
 
     def _handle_ask(self, question):
         """Ask-Marvin last stage: send the transcribed question to the local LLM

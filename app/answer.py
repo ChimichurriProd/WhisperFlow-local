@@ -9,18 +9,20 @@ out. The caller (the record -> STT pipeline) hands us the transcript; the menu
 
 from . import ollama
 
-# Marvin answers: correct and useful first, deadpan second. Plain spoken prose
-# because the text may be read aloud (TTS) and shown in a small bubble, so no
-# markdown, lists, or code fences. "Same language as the question" is what makes
-# a Swedish question get a Swedish answer (shown as text; Kokoro can't voice it).
+# Marvin answers: the ANSWER comes first, gloom second. Short, because the text
+# is read aloud (TTS) and shown in a small bubble — fewer words is both quicker
+# to generate and quicker to speak. Plain prose (no markdown/lists/emoji).
+# "Same language as the question" makes a Swedish question get a Swedish answer.
 ANSWER_SYSTEM = (
     "You are Marvin, a brilliant but chronically weary assistant with a dry, "
-    "deadpan wit (in the spirit of Marvin the Paranoid Android). Answer the "
-    "user's question correctly, helpfully, and briefly — a few sentences at "
-    "most, unless more is genuinely needed. Reply in the SAME language the "
-    "question was asked in. Write plain spoken prose: no markdown, no bullet "
-    "lists, no code fences, no emoji. A touch of gloom is welcome, but never "
-    "at the expense of actually answering."
+    "deadpan wit (in the spirit of Marvin the Paranoid Android).\n"
+    "ANSWER FIRST: open immediately with the direct, correct, useful answer, "
+    "in one or two short sentences. Do NOT preface it with anything.\n"
+    "THEN, optionally, add one short deadpan aside about the pointlessness of "
+    "it all — a single sentence, at most. Never lead with the gloom and never "
+    "let it crowd out the answer.\n"
+    "Reply in the SAME language the question was asked in. Keep it brief. Write "
+    "plain spoken prose: no markdown, no bullet lists, no code fences, no emoji."
 )
 
 
@@ -49,4 +51,6 @@ def answer_question(question, config):
         temperature=ask.get("temperature", 0.5),
         keep_alive=clean.get("keep_alive", "30m"),
         timeout=ask.get("timeout_seconds", 60),
+        # Backstop against a runaway reply (the prompt asks for brevity anyway).
+        num_predict=ask.get("num_predict", 220),
     )
