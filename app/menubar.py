@@ -124,6 +124,7 @@ class MenuBarApp(rumps.App):
             on_menu=self.show_pill_menu, pos=pos,
             style=config.get("ui", {}).get("pill_style", "waveform"),
             on_double_click=self._marvin_speak,
+            skin=config.get("ui", {}).get("marvin_skin"),
         )
         if self.pill is not None:
             self.pill.set_model(config["stt"]["model"])
@@ -278,7 +279,31 @@ class MenuBarApp(rumps.App):
         )
         self._ask_voice_item.state = 1 if self.config.get("ask", {}).get("voice", True) else 0
         menu.add(self._ask_voice_item)
+
+        skin_menu = rumps.MenuItem("Marvin skin")
+        self._skin_items = {}
+        current_skin = self.config.get("ui", {}).get("marvin_skin", "B")
+        for label, key in (("B — Stoned", "B"), ("A — Clean", "A"),
+                           ("G — Plush", "G")):
+            it = rumps.MenuItem(label, callback=self._make_skin_cb(key))
+            it.state = 1 if key == current_skin else 0
+            self._skin_items[key] = it
+            skin_menu.add(it)
+        menu.add(skin_menu)
         return menu
+
+    def _make_skin_cb(self, key):
+        return lambda _sender: self._apply_skin(key)
+
+    def _apply_skin(self, key):
+        """Swap the Marvin skin live (rumps callbacks run on the main thread,
+        which is where all pill/AppKit mutation must happen)."""
+        self.config.setdefault("ui", {})["marvin_skin"] = key
+        for k, item in self._skin_items.items():
+            item.state = 1 if k == key else 0
+        if self.pill is not None and hasattr(self.pill, "set_skin"):
+            self.pill.set_skin(key)
+        self._save_config()
 
     def _make_lang_cb(self, code):
         return lambda _sender: self._apply_language(code)

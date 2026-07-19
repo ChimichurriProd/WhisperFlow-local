@@ -136,7 +136,10 @@ def key_frame(img):
     # 7. GLOW: coloured pixels beyond the solid. Full-bright hue, alpha from
     #    luminance with a smooth exponent curve that breathes out to zero —
     #    no cut-off edge, so the halo fades naturally on any background.
-    colored = (~solid) & (sat > GLOW_SAT) & (v > 8)
+    # glow = anything BRIGHT beyond the head: saturated colour (cyan/green
+    # halo) OR white-hot bloom (bright but unsaturated). Only DIM neutral
+    # pixels are dropped — they are what caused the dark fringe.
+    colored = (~solid) & (v > 8) & ((sat > GLOW_SAT) | (v > 120))
     scale = np.clip(np.where(v > 1, 255.0 / np.maximum(v, 1.0), 1.0), 1.0, 8.0)
     galpha = np.clip((v / 255.0) ** GLOW_GAMMA * GLOW_GAIN, 0.0, 1.0)
     for c in range(3):

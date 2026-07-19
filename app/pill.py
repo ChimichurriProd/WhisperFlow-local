@@ -68,12 +68,16 @@ _MODEL_IDLE_CLIP = {
 # have their own event triggers.
 _IDLE_GESTURE_CLIPS = ("skeptic", "curious", "glance", "blink", "yawn", "emote",
                        "angry", "love", "stressed", "glow",
-                       "droop", "drift", "eyeroll")
+                       "droop", "drift", "eyeroll",          # B personals
+                       "focus", "gleam", "doubletake",       # A personals
+                       "stretch", "nuzzle", "hearteyes")     # G personals
 # Per-clip one-shot playback speed (frames advanced per 20 Hz tick; default 1.0).
 # The 120-frame out-and-back gestures play at 1.6 (~3.75 s); spin stays a
 # quick flourish.
 _ONESHOT_SPEED = {"spin": 2.4, "angry": 1.6, "droop": 1.6, "drift": 1.6,
-                  "eyeroll": 1.6}
+                  "eyeroll": 1.6, "focus": 1.6, "gleam": 1.6,
+                  "doubletake": 1.6, "stretch": 1.6, "nuzzle": 1.6,
+                  "hearteyes": 1.6}
 
 try:
     from AppKit import (
@@ -142,35 +146,52 @@ try:
     def _hover_label(model):
         return f"Model: {model}"
 
-    def _load_marvin_center():
+    def _marvin_dir(skin=None):
+        """Asset dir for a Marvin skin. assets/marvin/ is the default (B);
+        alternate skins live in assets/marvin/_skins/<name>/ with the same
+        layout (center.png, back.png, meta.json, <clip>/frame_*.png)."""
+        from pathlib import Path
+
+        base = Path(__file__).resolve().parent.parent / "assets" / "marvin"
+        if skin:
+            cand = base / "_skins" / str(skin)
+            if cand.is_dir():
+                return cand
+        return base
+
+    def _load_marvin_center(base):
         """Load the resting head image (center.png), shown when idle."""
-        from pathlib import Path
-
-        p = Path(__file__).resolve().parent.parent / "assets" / "marvin" / "center.png"
+        p = base / "center.png"
         return NSImage.alloc().initWithContentsOfFile_(str(p)) if p.exists() else None
 
-    def _load_marvin_back():
+    def _load_marvin_back(base):
         """Load the back-of-head 'oracle' face (back.png), shown while answering."""
-        from pathlib import Path
-
-        p = Path(__file__).resolve().parent.parent / "assets" / "marvin" / "back.png"
+        p = base / "back.png"
         return NSImage.alloc().initWithContentsOfFile_(str(p)) if p.exists() else None
 
-    def _load_marvin_clips():
-        """Load frame-sequence clips from assets/marvin/<name>/frame_*.png plus
+    def _load_marvin_meta(base):
+        """Optional per-skin meta.json (e.g. measured oracle eye centres)."""
+        import json
+
+        p = base / "meta.json"
+        try:
+            return json.loads(p.read_text()) if p.exists() else {}
+        except Exception:
+            return {}
+
+    def _load_marvin_clips(base):
+        """Load frame-sequence clips from <base>/<name>/frame_*.png plus
         per-frame eye positions from <name>/eyes.json.
 
         Returns (clips, eyes): clips={name:[NSImage,...]}, eyes={name:[[(lx,ly),
         (rx,ry)],...]} for the voice-reactive glow.
         """
         import json
-        from pathlib import Path
 
-        base = Path(__file__).resolve().parent.parent / "assets" / "marvin"
         clips, eyes = {}, {}
         if base.is_dir():
             for sub in base.iterdir():
-                if not sub.is_dir():
+                if not sub.is_dir() or sub.name.startswith("_"):
                     continue
                 imgs = []
                 for f in sorted(sub.glob("frame_*.png")):
@@ -431,7 +452,7 @@ try:
                 NSBezierPath.bezierPathWithOvalInRect_(
                     NSMakeRect(w * 0.02, h * 0.02, w * 0.96, h * 0.96)
                 ).addClip()
-                self._eye_glow(rx, ry, rw, rh, _BACK_EYES, level,
+                self._eye_glow(rx, ry, rw, rh, c.back_eyes, level,
                                rgb=_BACK_EYE_RGB)
                 NSGraphicsContext.restoreGraphicsState()
 
@@ -558,7 +579,7 @@ try:
 
     class _Pill:
         def __init__(self, on_click=None, on_move=None, on_menu=None, pos=None,
-                     style="waveform", on_double_click=None):
+                     style="waveform", on_double_click=None, skin=None):
             self.on_click = on_click
             self.on_double_click = on_double_click
             self.on_move = on_move
@@ -567,11 +588,13 @@ try:
             self.mode = "idle"
             self.model = "small"
             self.hover = False
-            self.center = _load_marvin_center() if style == "marvin" else None
-            self.back = _load_marvin_back() if style == "marvin" else None
-            self.clips, self.clip_eyes = (
-                _load_marvin_clips() if style == "marvin" else ({}, {})
-            )
+            self.skin = skin
+            self.center = None
+            self.back = None
+            self.clips, self.clip_eyes = {}, {}
+            self.back_eyes = _BACK_EYES
+            if style == "marvin":
+                self._load_skin_assets(skin)
             self.levels = [0.0] * _BARS
             self._phase = 0.0
             self._anim = 0.0
@@ -660,6 +683,34 @@ try:
                 self.window.setFrame_display_(new, True)
 
         # -------- main-thread updates -------------------------------------
+
+        def _load_skin_assets(self, skin):
+            base = _marvin_dir(skin)
+            self.center = _load_marvin_center(base)
+            self.back = _load_marvin_back(base)
+            self.clips, self.clip_eyes = _load_marvin_clips(base)
+            meta = _load_marvin_meta(base)
+            be = meta.get("back_eyes")
+            self.back_eyes = (tuple(map(tuple, be)) if be else _BACK_EYES)
+
+        def set_skin(self, skin):
+            """Swap to another Marvin skin in place (main thread only). Resets
+            any in-flight clip state so the new skin starts clean."""
+            if self.style != "marvin":
+                return
+            self.skin = skin
+            self._load_skin_assets(skin)
+            self._oneshot = None
+            self._demo_queue = []
+            self._clip_f = 0.0
+            self._clip_dir = 1
+            self._turn_f = 0.0
+            self._face_target = 0.0
+            self._idle_gestures = [
+                n for n in _IDLE_GESTURE_CLIPS if n in self.clips
+            ]
+            self._idle_gesture_t = random.randint(300, 700)
+            self._render()
 
         def set_model(self, model):
             self.model = model
@@ -805,7 +856,9 @@ try:
         def play_all(self):
             """Showcase: play every gesture once, back to back."""
             order = ["listening", "thinking", "angry", "droop", "drift",
-                     "eyeroll", "wake", "alert", "happy", "sad", "love",
+                     "eyeroll", "focus", "gleam", "doubletake",
+                     "stretch", "nuzzle", "hearteyes",
+                     "wake", "alert", "happy", "sad", "love",
                      "stressed", "glow", "skeptic", "blink",
                      "glance", "look_left", "look_right", "nod", "shake",
                      "emote", "super_saiyan", "spin"]
@@ -845,12 +898,12 @@ try:
             return self.clips.get(name) if name else None
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
-                    style="waveform", on_double_click=None):
+                    style="waveform", on_double_click=None, skin=None):
         """Build and show the pill. Returns a controller, or None on failure."""
         try:
             return _Pill(on_click=on_click, on_move=on_move,
                          on_menu=on_menu, pos=pos, style=style,
-                         on_double_click=on_double_click)
+                         on_double_click=on_double_click, skin=skin)
         except Exception as exc:  # pragma: no cover - UI environment dependent
             print(f"[pill] disabled ({exc})", flush=True)
             return None
@@ -861,5 +914,5 @@ except Exception as _pill_import_err:  # pragma: no cover - AppKit unavailable
     _tb.print_exc()
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
-                    style="waveform", on_double_click=None):
+                    style="waveform", on_double_click=None, skin=None):
         return None

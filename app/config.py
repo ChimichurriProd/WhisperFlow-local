@@ -65,6 +65,10 @@ DEFAULTS = {
     "ui": {
         # "marvin" (baked clips) | "waveform"
         "pill_style": "marvin",
+        # Which Marvin: "B" (refined 'stoned', the default set in assets/marvin),
+        # "A" (faithful refresh) or "G" (knitted plush) — alternates live in
+        # assets/marvin/_skins/<name>/.
+        "marvin_skin": "B",
         # Double-click Marvin to hear a random deadpan quip (local TTS).
         "double_click_talk": True,
     },
@@ -94,6 +98,10 @@ def load_config(path=None):
     # configs fall back to the baked-clips Marvin.
     if cfg.get("ui", {}).get("pill_style") == "marvin_live":
         cfg["ui"]["pill_style"] = "marvin"
+    # Always boot on the biggest STT model: clicking Marvin cycles (and
+    # persists) the model, so a stray click would otherwise carry a smaller
+    # one into the next launch. In-session switching still works.
+    cfg["stt"]["model"] = DEFAULTS["stt"]["model"]
     method = cfg["injection"]["delivery_method"]
     if method not in VALID_DELIVERY_METHODS:
         raise ValueError(

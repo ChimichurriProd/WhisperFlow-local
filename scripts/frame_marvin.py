@@ -126,7 +126,10 @@ def key_rgba(img):
         rgb[..., c] = np.where(body, np.clip(rgb[..., c] * lift, 0, 255),
                                rgb[..., c])
 
-    colored = (~solid) & (sat > GLOW_SAT) & (v > 8)
+    # glow = anything BRIGHT beyond the head: saturated colour (cyan/green
+    # halo) OR white-hot bloom (bright but unsaturated). Only DIM neutral
+    # pixels are dropped — they are what caused the dark fringe.
+    colored = (~solid) & (v > 8) & ((sat > GLOW_SAT) | (v > 120))
     scale = np.clip(np.where(v > 1, 255.0 / np.maximum(v, 1.0), 1.0), 1.0, 8.0)
     galpha = np.clip((v / 255.0) ** GLOW_GAMMA * GLOW_GAIN, 0.0, 1.0)
     for c in range(3):
