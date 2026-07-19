@@ -21,25 +21,23 @@ _HEIGHT = 32.0
 _WIDTH_IDLE = 32.0  # equals height => a round dot when idle
 _WIDTH_REC = 250.0  # hover width is measured from the label (see _target_width)
 _BARS = 24
-_MARVIN_SIZE = 280.0  # big window so the super_saiyan aura can flare FAR beyond the head box
-# without clipping. The extra window is transparent/invisible — only Marvin + his aura show.
-_MARVIN_INSET = 0.386  # normal head ~58px in the window
-# super_saiyan: Marvin's head stays FIXED at the idle size; the golden aura flares far BEYOND the
-# head box into the big window and never clips. A fixed (larger) inset keeps the head == idle size
-# while the aura fills out to ~125px from centre — well inside the 280px window.
-_SS_CLIP = "super_saiyan"
-_SS_INSET = 0.114
+_MARVIN_SIZE = 280.0  # big window so auras/halos can flare beyond the head without clipping.
+# The extra window is transparent/invisible — only Marvin + his glow show.
+# v3 clips are authored with ONE consistent framing: the head is ~70% of the
+# 256px frame with a wide safe margin baked in for glow/motion, so every clip
+# (including effect-heavy ones) draws with this single inset. Head ~58px.
+_MARVIN_INSET = 0.352
 
 # Two-faced Marvin: a second "oracle" persona lives on the BACK of his head
-# (cyan lens eyes, assets/marvin/back.png). While dictating he faces you as the
-# green-eyed "scribe"; when he answers a question he physically turns around to
-# reveal the oracle, then turns back when he's done. The turn reuses the spin
-# turnaround frames: index 0 = front, _TURN_BACK = full back (180°).
-_TURN_BACK = 60        # spin frame index showing the full back of the head
-_TURN_SPEED = 3.0      # spin frames advanced per 20 Hz tick (~1.0 s per half-turn)
-# Cyan eye centres on the back face (normalized to the drawn head, y from top) —
-# same position as the front eyes, so it reads as the same head's other face.
-_BACK_EYES = ((0.505 - 0.174, 0.545), (0.505 + 0.174, 0.545))
+# (cyan lens eyes + halo, assets/marvin/back.png). While dictating he faces you
+# as the green-eyed "scribe"; when he answers a question he whips around (motion
+# -blurred spin clip: frame 0 = front scribe, frame _TURN_BACK = cyan oracle) to
+# reveal the oracle, then whips back when he's done.
+_TURN_BACK = 60        # spin frame index showing the full oracle face
+_TURN_SPEED = 4.0      # spin frames advanced per 20 Hz tick (~0.75 s per turn)
+# Cyan eye centres on the back face (normalized to the frame, y from top),
+# measured from back.png — drives the oracle's voice-reactive glow.
+_BACK_EYES = ((0.360, 0.525), (0.638, 0.525))
 _BACK_EYE_RGB = (0.37, 0.88, 1.0)   # cyan bloom for the oracle's voice glow
 
 
@@ -54,8 +52,8 @@ def _ease_toward(cur, target, speed):
     return cur
 
 # Per-STT-model idle loop clips: when assets/marvin/<clip>/ exists for the
-# active model, Marvin's resting loop plays it (largest model = electric,
-# smallest = sleepy) so you can tell at a glance which model is loaded.
+# active model, Marvin's resting loop plays it. The v3 set ships ONE shared
+# "idle" (the per-model folders fall back to it — see _active_clip_name).
 _MODEL_IDLE_CLIP = {
     "base": "idle_base",
     "small": "idle_small",
@@ -69,10 +67,13 @@ _MODEL_IDLE_CLIP = {
 # folder (e.g. "blink") auto-enrolls it. Excludes nod/shake/wake/spin, which
 # have their own event triggers.
 _IDLE_GESTURE_CLIPS = ("skeptic", "curious", "glance", "blink", "yawn", "emote",
-                       "angry", "love", "stressed", "glow")
+                       "angry", "love", "stressed", "glow",
+                       "droop", "drift", "eyeroll")
 # Per-clip one-shot playback speed (frames advanced per 20 Hz tick; default 1.0).
-# spin is a 120-frame full 360°; 2.4/tick plays it in ~2.5 s as a quick flourish.
-_ONESHOT_SPEED = {"spin": 2.4}
+# The 120-frame out-and-back gestures play at 1.6 (~3.75 s); spin stays a
+# quick flourish.
+_ONESHOT_SPEED = {"spin": 2.4, "angry": 1.6, "droop": 1.6, "drift": 1.6,
+                  "eyeroll": 1.6}
 
 try:
     from AppKit import (
@@ -368,12 +369,9 @@ try:
             if c._turn_f > 0.5:
                 self._draw_marvin_back(c, w, h)
                 return
-            shown = (c._oneshot if (c._oneshot and c._oneshot in c.clips)
-                     else c._active_clip_name(c.mode))
-            # super_saiyan: draw at a fixed larger rect so the head == idle size while the aura
-            # flares beyond the head box; every other clip uses the normal head-box inset.
-            base_inset = _SS_INSET if shown == _SS_CLIP else _MARVIN_INSET
-            m = w * base_inset
+            # v3 clips share one framing (head ~70% + safe margin baked into the
+            # frames), so every clip draws at the same inset — no per-clip boxes.
+            m = w * _MARVIN_INSET
             rx, ry, rw, rh = m, m, w - 2 * m, h - 2 * m
             rect = NSMakeRect(rx, ry, rw, rh)
 
@@ -731,13 +729,15 @@ try:
             # ------- front (scribe) persona -------
             # Mode transitions trigger one-shot gestures.
             if mode == "recording" and self._prev_mode != "recording":
-                order = [n for n in ("alert", "shake", "nod") if n in self.clips]
+                order = [n for n in ("listening", "alert", "shake", "nod")
+                         if n in self.clips]
                 if order:  # alternate the listening loop each dictation
                     cur = self._rec_clip if self._rec_clip in order else order[0]
                     self._rec_clip = order[(order.index(cur) + 1) % len(order)]
                 self.play_oneshot("wake")     # perk up when you start (if present)
             elif mode == "transcribing" and self._prev_mode == "recording":
-                self.play_oneshot("spin")     # flourish when you finish
+                if "thinking" not in self.clips:
+                    self.play_oneshot("spin")  # legacy flourish (no thinking clip)
             self._prev_mode = mode
 
             # Occasional idle micro-gesture: pick a random gesture from the pool
@@ -804,7 +804,8 @@ try:
 
         def play_all(self):
             """Showcase: play every gesture once, back to back."""
-            order = ["wake", "alert", "happy", "sad", "angry", "love",
+            order = ["listening", "thinking", "angry", "droop", "drift",
+                     "eyeroll", "wake", "alert", "happy", "sad", "love",
                      "stressed", "glow", "skeptic", "blink",
                      "glance", "look_left", "look_right", "nod", "shake",
                      "emote", "super_saiyan", "spin"]
@@ -818,14 +819,24 @@ try:
 
         def _active_clip_name(self, mode):
             if mode == "recording":
-                return self._rec_clip if self._rec_clip in self.clips else (
-                    "shake" if "shake" in self.clips else None)
+                if self._rec_clip in self.clips:
+                    return self._rec_clip
+                for n in ("listening", "shake"):
+                    if n in self.clips:
+                        return n
+                return None
             if mode == "transcribing":
+                # v3: a dedicated pondering loop; legacy sets twirled the spin.
+                if "thinking" in self.clips:
+                    return "thinking"
                 return "spin" if "spin" in self.clips else None
             if mode == "sleep":
                 return "sleep" if "sleep" in self.clips else None
             if mode == "idle":
+                # per-model idle if that clip exists, else the shared idle
                 name = _MODEL_IDLE_CLIP.get(self.model)
+                if name not in self.clips:
+                    name = "idle"
                 return name if name in self.clips else None
             return None
 
