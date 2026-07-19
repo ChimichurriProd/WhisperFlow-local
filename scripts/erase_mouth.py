@@ -46,12 +46,16 @@ def erase(path):
         int(x0 + ROI_X[0] * w):int(x0 + ROI_X[1] * w)] = True
     roi &= solid
 
-    # keep clear of the glowing eyes. HUE-aware: eyes are GREEN/CYAN — a red/
-    # maroon mouth interior is saturated too and must NOT be protected (that
-    # was how mouth shards kept surviving earlier passes).
+    # keep clear of the glowing eyes. HUE-aware (eyes are green/cyan — a red/
+    # maroon mouth interior is saturated too and must NOT be protected) AND
+    # position-aware (eyes live in the upper head; a green FELT mouth in the
+    # mouth zone is a hallucination, not an eye — seen on the plush skin).
     R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
     greenish = (G > R * 1.05) | (B > R * 1.2)
     glowing = binary_dilation(greenish & (v > 95) & solid, iterations=4)
+    upper = np.zeros_like(solid)
+    upper[:int(y0 + 0.66 * h)] = True
+    glowing &= upper
     roi &= ~glowing
 
     local = gaussian_filter(v, BLUR)

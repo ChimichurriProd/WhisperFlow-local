@@ -52,6 +52,7 @@ CLOSE_ITERS = 3     # close bays this size in the head mask (chin pinch-offs)
 HEAD_GROW = 0       # extra dilation of the solid mask (feather replaces it)
 EDGE_SIGMA = 1.0    # gaussian feather of the mask -> anti-aliased, stable edge
 SHADOW_FLOOR = 68   # lift the head's black point so the chin isn't a dark smudge
+VIGNETTE_START = 0.40  # radial glow falloff starts here (fraction of frame size)
 
 
 def key_frame(img):
@@ -146,6 +147,20 @@ def key_frame(img):
         rgb[..., c] = np.where(colored, np.clip(rgb[..., c] * scale, 0, 255),
                                rgb[..., c])
     alpha = np.where(colored, np.maximum(alpha, galpha), alpha)
+
+    # 8. Radial vignette: if an aura/flame reaches the frame border it would
+    #    cut off in a hard straight line ("boxed") — and a full-frame energy
+    #    flash would show as a bright SQUARE. A circular falloff dissolves
+    #    both into a round burst. The head sits well inside the safe radius,
+    #    so only glow is touched.
+    hgt, wdt = alpha.shape
+    cy, cx = (hgt - 1) / 2.0, (wdt - 1) / 2.0
+    yy, xx = np.mgrid[0:hgt, 0:wdt]
+    r = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    r_hi = 0.50 * min(hgt, wdt)
+    r_lo = VIGNETTE_START * min(hgt, wdt)
+    fade = np.clip((r_hi - r) / max(r_hi - r_lo, 1.0), 0.0, 1.0)
+    alpha *= fade
 
     a[..., :3] = rgb.astype(np.uint8)
     a[..., 3] = (alpha * 255).astype(np.uint8)

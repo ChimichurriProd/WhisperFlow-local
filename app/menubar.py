@@ -611,7 +611,9 @@ class MenuBarApp(rumps.App):
         # in the showcase grid window.
         if self.pill is not None and getattr(self.pill, "clips", None):
             anim_sub = submenu("Animate")
-            add("All at once…", lambda: self.pill.show_showcase(), anim_sub)
+            add("Play all on Marvin", lambda: self.pill.play_all(), anim_sub)
+            add("All at once (window)…",
+                lambda: self.pill.show_showcase(), anim_sub)
             for cname in sorted(self.pill.clips):
                 add(cname.replace("_", " ").title(),
                     (lambda n=cname: self.pill.play_oneshot(n)), anim_sub)
