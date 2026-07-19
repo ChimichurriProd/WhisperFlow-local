@@ -590,6 +590,15 @@ try:
             return self
 
         def drawRect_(self, rect):
+            # An exception escaping drawRect_ takes the whole app down via
+            # AppKit's _crashOnException — never let one out.
+            try:
+                self._draw()
+            except Exception as exc:
+                print(f"[showcase] draw failed: {exc!r}", flush=True)
+
+        @objc.python_method
+        def _draw(self):
             g = self.gallery
             _rgb(0.07, 0.07, 0.08).setFill()
             NSBezierPath.fillRect_(self.bounds())
@@ -597,6 +606,7 @@ try:
             attrs = NSMutableDictionary.dictionary()
             attrs[NSFontAttributeName] = NSFont.systemFontOfSize_(11.0)
             attrs[NSForegroundColorAttributeName] = _rgb(0.72, 0.78, 0.72)
+            NSString = objc.lookUpClass("NSString")
             for i, name in enumerate(g.names):
                 col, row = i % g.cols, i // g.cols
                 x = 10.0 + col * g.CELL_W
@@ -606,7 +616,7 @@ try:
                 img_rect = NSMakeRect(x + (g.CELL_W - g.IMG) / 2.0,
                                       y + g.CELL_H - g.IMG - 4.0, g.IMG, g.IMG)
                 frames[fi].drawInRect_(img_rect)
-                label = name.replace("_", " ")
+                label = NSString.stringWithString_(name.replace("_", " "))
                 lw = label.sizeWithAttributes_(attrs).width
                 label.drawAtPoint_withAttributes_(
                     NSMakePoint(x + (g.CELL_W - lw) / 2.0, y + 6.0), attrs)
