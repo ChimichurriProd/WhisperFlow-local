@@ -607,9 +607,11 @@ class MenuBarApp(rumps.App):
                 add(label, (lambda k=key: self._apply_skin(k)), look_sub,
                     state=(key == cur_skin))
 
-        # Preview all animations we've got.
+        # Preview animations: one-shot on the pill, or the whole set at once
+        # in the showcase grid window.
         if self.pill is not None and getattr(self.pill, "clips", None):
             anim_sub = submenu("Animate")
+            add("All at once…", lambda: self.pill.show_showcase(), anim_sub)
             for cname in sorted(self.pill.clips):
                 add(cname.replace("_", " ").title(),
                     (lambda n=cname: self.pill.play_oneshot(n)), anim_sub)

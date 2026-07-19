@@ -67,7 +67,7 @@ _MODEL_IDLE_CLIP = {
 # folder (e.g. "blink") auto-enrolls it. Excludes nod/shake/wake/spin, which
 # have their own event triggers.
 _IDLE_GESTURE_CLIPS = ("skeptic", "curious", "glance", "blink", "yawn", "emote",
-                       "angry", "love", "stressed", "glow",
+                       "angry", "love", "stressed", "glow", "super_saiyan",
                        "droop", "drift", "eyeroll",          # B personals
                        "focus", "gleam", "doubletake",       # A personals
                        "stretch", "nuzzle", "hearteyes")     # G personals
@@ -77,7 +77,7 @@ _IDLE_GESTURE_CLIPS = ("skeptic", "curious", "glance", "blink", "yawn", "emote",
 _ONESHOT_SPEED = {"spin": 2.4, "angry": 1.6, "droop": 1.6, "drift": 1.6,
                   "eyeroll": 1.6, "focus": 1.6, "gleam": 1.6,
                   "doubletake": 1.6, "stretch": 1.6, "nuzzle": 1.6,
-                  "hearteyes": 1.6}
+                  "hearteyes": 1.6, "super_saiyan": 1.6}
 
 try:
     from AppKit import (
@@ -577,6 +577,81 @@ try:
                 NSMakePoint(x, (h - tsize.height) / 2.0), attrs
             )
 
+    class _ShowcaseView(NSView):
+        """Grid canvas for the showcase window: draws every clip's current
+        frame with its name underneath. Frame advancement lives in _Showcase;
+        this just renders."""
+
+        def initWithGallery_(self, gallery):
+            self = objc.super(_ShowcaseView, self).init()
+            if self is None:
+                return None
+            self.gallery = gallery
+            return self
+
+        def drawRect_(self, rect):
+            g = self.gallery
+            _rgb(0.07, 0.07, 0.08).setFill()
+            NSBezierPath.fillRect_(self.bounds())
+            H = self.bounds().size.height
+            attrs = NSMutableDictionary.dictionary()
+            attrs[NSFontAttributeName] = NSFont.systemFontOfSize_(11.0)
+            attrs[NSForegroundColorAttributeName] = _rgb(0.72, 0.78, 0.72)
+            for i, name in enumerate(g.names):
+                col, row = i % g.cols, i // g.cols
+                x = 10.0 + col * g.CELL_W
+                y = H - 10.0 - (row + 1) * g.CELL_H
+                frames = g.clips[name]
+                fi = int(g.pos[name]) % len(frames)
+                img_rect = NSMakeRect(x + (g.CELL_W - g.IMG) / 2.0,
+                                      y + g.CELL_H - g.IMG - 4.0, g.IMG, g.IMG)
+                frames[fi].drawInRect_(img_rect)
+                label = name.replace("_", " ")
+                lw = label.sizeWithAttributes_(attrs).width
+                label.drawAtPoint_withAttributes_(
+                    NSMakePoint(x + (g.CELL_W - lw) / 2.0, y + 6.0), attrs)
+
+    class _Showcase:
+        """'All animations' window: every clip of the active skin looping at
+        once in a grid. Advanced from the pill's 20 Hz tick (main thread)."""
+
+        ORDER = ["idle", "listening", "thinking", "angry",
+                 "droop", "drift", "eyeroll", "focus", "gleam", "doubletake",
+                 "stretch", "nuzzle", "hearteyes", "super_saiyan", "spin"]
+        CELL_W, CELL_H, IMG = 152.0, 176.0, 140.0
+
+        def __init__(self, pill):
+            self.clips = dict(pill.clips)
+            self.names = [n for n in self.ORDER if n in self.clips]
+            self.names += [n for n in sorted(self.clips)
+                           if n not in self.names]
+            self.pos = {n: 0.0 for n in self.names}
+            self.cols = min(4, max(1, len(self.names)))
+            self.rows = (len(self.names) + self.cols - 1) // self.cols
+            w = self.cols * self.CELL_W + 20.0
+            h = self.rows * self.CELL_H + 20.0
+            self.window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(220.0, 220.0, w, h),
+                1 | 2,  # titled | closable
+                NSBackingStoreBuffered,
+                False,
+            )
+            self.window.setTitle_("Marvin — all animations")
+            self.window.setReleasedWhenClosed_(False)
+            self.view = _ShowcaseView.alloc().initWithGallery_(self)
+            self.view.setFrame_(NSMakeRect(0, 0, w, h))
+            self.window.setContentView_(self.view)
+            self.window.makeKeyAndOrderFront_(None)
+
+        def tick(self):
+            """Advance all clips one frame; False once the window is closed."""
+            if not self.window.isVisible():
+                return False
+            for n in self.names:
+                self.pos[n] = (self.pos[n] + 1.0) % len(self.clips[n])
+            self.view.setNeedsDisplay_(True)
+            return True
+
     class _Pill:
         def __init__(self, on_click=None, on_move=None, on_menu=None, pos=None,
                      style="waveform", on_double_click=None, skin=None):
@@ -619,6 +694,7 @@ try:
             ]
             self._idle_gesture_t = random.randint(300, 700)
             self._demo_queue = []      # remaining clips in a "play all" showcase
+            self._showcase = None      # the "all animations" grid window
             _marv = style == "marvin"
             self._h = _MARVIN_SIZE if _marv else _HEIGHT
             self._w = _MARVIN_SIZE if _marv else _WIDTH_IDLE
@@ -710,6 +786,9 @@ try:
                 n for n in _IDLE_GESTURE_CLIPS if n in self.clips
             ]
             self._idle_gesture_t = random.randint(300, 700)
+            if self._showcase is not None and self._showcase.window.isVisible():
+                self._showcase.window.close()   # reopen with the new skin
+                self._showcase = _Showcase(self)
             self._render()
 
         def set_model(self, model):
@@ -735,8 +814,19 @@ try:
             self._resize(self._target_width())
             self.view.setNeedsDisplay_(True)
 
+        def show_showcase(self):
+            """Open (or focus) the grid window with every clip animating."""
+            if self.style != "marvin" or not self.clips:
+                return
+            if self._showcase is not None and self._showcase.window.isVisible():
+                self._showcase.window.makeKeyAndOrderFront_(None)
+                return
+            self._showcase = _Showcase(self)
+
         def tick(self, mode, level):
             self.mode = mode
+            if self._showcase is not None and not self._showcase.tick():
+                self._showcase = None
             if mode == "recording":
                 self.levels = self.levels[1:] + [max(0.03, level)]
             elif mode == "transcribing":

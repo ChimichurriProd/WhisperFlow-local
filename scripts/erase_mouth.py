@@ -1,35 +1,31 @@
 #!/usr/bin/env python3
-"""Erase hallucinated mouth lines from keyed Marvin frames.
+"""Erase hallucinated mouth features from keyed Marvin frames.
 
 Kling sometimes stitches a small dark mouth onto Marvin's blank lower face
-(the plush skin is especially prone). Rather than re-rolling generations,
-remove it deterministically. The mouth is a COHERENT dark blob much wider
-than the wool-stitch texture scale, in the lower-central face:
+(the plush skin is especially prone). Post-fix deterministically: within the
+lower-central face zone, EVERY locally-dark anomaly (anything sitting well
+below a large-scale blur of its neighbourhood — i.e. features bigger than the
+knit-stitch scale; a smooth shading gradient never triggers) is replaced with
+smooth surrounding texture via normalised convolution over the clean pixels,
+plus matched grain so the patch reads as wool/shell at pill size. No blob
+heuristics — earlier size-filtered versions kept missing mouth fragments and
+left flickering shards.
 
-  1. dark = pixels well below a large-scale blur of their neighbourhood
-     (the blur rides over the fine knit texture, so individual stitches
-     don't trigger — only features bigger than the texture scale do)
-  2. keep blobs that are mouth-shaped: wide (>= MIN_W px), not huge
-  3. fill each blob by copying REAL texture from just above it (same wool /
-     shell shading), so the patch keeps the material look
-
-Usage: erase_mouth.py <clip_dir> [<clip_dir> ...]
-Rewrites frame_*.png in place. No-op on clean frames.
+Usage: erase_mouth.py <clip_dir> [<clip_dir> ...]   (rewrites frames in place)
 """
 import sys
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import binary_dilation, find_objects, gaussian_filter, label
+from scipy.ndimage import binary_dilation, gaussian_filter, label
 
-ROI_Y = (0.55, 0.95)   # mouth zone within the head bbox (fraction of height)
-ROI_X = (0.18, 0.82)
-BLUR = 8               # neighbourhood scale; > knit-stitch scale
-DARK_DIFF = 13         # how far below the local mean counts as "a dark feature"
-MIN_W = 12             # blob min width  -> ignores stitches/speckle
-MAX_H = 38             # blob max height -> ignores big shadow regions
-MIN_AREA = 30
+ROI_Y = (0.55, 0.96)   # mouth zone within the head bbox (fraction of height)
+ROI_X = (0.15, 0.85)
+BLUR = 8               # anomaly detection scale (> stitch texture)
+DARK_DIFF = 10         # below local mean by this much = anomaly
+FILL_SIGMA = 7.0       # normalised-convolution fill smoothness
+GRAIN = 9.0            # matched-noise amplitude cap
 
 
 def erase(path):
@@ -50,49 +46,38 @@ def erase(path):
         int(x0 + ROI_X[0] * w):int(x0 + ROI_X[1] * w)] = True
     roi &= solid
 
-    # Never touch the eyes: exclude anything at or near the GLOWING coloured
-    # eye regions (bright + saturated) — their dark rims would otherwise read
-    # as "wide dark blobs" and get patched over. Brightness matters: the
-    # hallucinated mouth stitches are dark maroon (saturated but DIM), and
-    # must stay targetable.
-    rgbmax = rgb.max(axis=2)
-    sat = np.where(rgbmax > 1,
-                   (rgbmax - rgb.min(axis=2)) / np.maximum(rgbmax, 1.0), 0.0)
-    eyes = binary_dilation((sat > 0.18) & (v > 95) & solid, iterations=7)
-    roi &= ~eyes
+    # keep clear of the glowing eyes. HUE-aware: eyes are GREEN/CYAN — a red/
+    # maroon mouth interior is saturated too and must NOT be protected (that
+    # was how mouth shards kept surviving earlier passes).
+    R, G, B = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    greenish = (G > R * 1.05) | (B > R * 1.2)
+    glowing = binary_dilation(greenish & (v > 95) & solid, iterations=4)
+    roi &= ~glowing
 
     local = gaussian_filter(v, BLUR)
-    dark = roi & ((local - v) > DARK_DIFF)
-    lbl, n = label(dark)
-    if not n:
+    mask = roi & ((local - v) > DARK_DIFF)
+    if mask.sum() < 20:
         return False
+    mask = binary_dilation(mask, iterations=3) & roi
 
-    changed = False
-    for i, sl in enumerate(find_objects(lbl), start=1):
-        if sl is None:
-            continue
-        bh = sl[0].stop - sl[0].start
-        bw = sl[1].stop - sl[1].start
-        blob = lbl[sl] == i
-        if bw < MIN_W or bh > MAX_H or blob.sum() < MIN_AREA:
-            continue
-        patch = binary_dilation(blob, iterations=2)
-        dy = bh + 6                      # copy source: just above the blob
-        src_top = sl[0].start - dy
-        if src_top < y0:
-            continue
-        py, px = np.where(patch)
-        ty = py + sl[0].start
-        tx = px + sl[1].start
-        sy = ty - dy
-        ok = solid[sy, tx]               # only copy from real head pixels
-        rgb[ty[ok], tx[ok]] = rgb[sy[ok], tx[ok]]
-        changed = True
+    # normalised convolution over clean pixels -> smooth local texture colour
+    clean = (solid & ~mask & ~glowing).astype(np.float32)
+    filled = np.empty_like(rgb)
+    denom = gaussian_filter(clean, FILL_SIGMA) + 1e-6
+    for c in range(3):
+        filled[..., c] = gaussian_filter(rgb[..., c] * clean, FILL_SIGMA) / denom
 
-    if changed:
-        a[..., :3] = rgb.astype(np.uint8)
-        Image.fromarray(a, "RGBA").save(path)
-    return changed
+    # matched grain so the patch isn't a flat smudge on the knit texture
+    ring = binary_dilation(mask, iterations=8) & ~mask & solid & ~glowing
+    std = float(rgb[ring].std(axis=0).mean()) if ring.sum() > 30 else 6.0
+    rng = np.random.default_rng(0)
+    my, mx = np.where(mask)
+    noise = rng.normal(0.0, min(std, GRAIN) * 0.6, size=(len(my), 1))
+    rgb[my, mx] = np.clip(filled[my, mx] + noise, 0, 255)
+
+    a[..., :3] = rgb.astype(np.uint8)
+    Image.fromarray(a, "RGBA").save(path)
+    return True
 
 
 def main():
