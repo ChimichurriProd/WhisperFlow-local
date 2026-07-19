@@ -70,14 +70,16 @@ _IDLE_GESTURE_CLIPS = ("skeptic", "curious", "glance", "blink", "yawn", "emote",
                        "angry", "love", "stressed", "glow", "super_saiyan",
                        "droop", "drift", "eyeroll",          # B personals
                        "focus", "gleam", "doubletake",       # A personals
-                       "stretch", "nuzzle", "hearteyes")     # G personals
+                       "stretch", "nuzzle", "hearteyes",     # G personals
+                       "dizzy", "frazzle", "disco")          # G crazy set
 # Per-clip one-shot playback speed (frames advanced per 20 Hz tick; default 1.0).
 # The 120-frame out-and-back gestures play at 1.6 (~3.75 s); spin stays a
 # quick flourish.
 _ONESHOT_SPEED = {"spin": 2.4, "angry": 1.6, "droop": 1.6, "drift": 1.6,
                   "eyeroll": 1.6, "focus": 1.6, "gleam": 1.6,
                   "doubletake": 1.6, "stretch": 1.6, "nuzzle": 1.6,
-                  "hearteyes": 1.6, "super_saiyan": 1.6}
+                  "hearteyes": 1.6, "super_saiyan": 1.6, "dizzy": 1.6,
+                  "frazzle": 1.6, "disco": 1.6}
 
 try:
     from AppKit import (
@@ -627,7 +629,8 @@ try:
 
         ORDER = ["idle", "listening", "thinking", "angry",
                  "droop", "drift", "eyeroll", "focus", "gleam", "doubletake",
-                 "stretch", "nuzzle", "hearteyes", "super_saiyan", "spin"]
+                 "stretch", "nuzzle", "hearteyes", "dizzy", "frazzle",
+                 "disco", "super_saiyan", "spin"]
         CELL_W, CELL_H, IMG = 152.0, 176.0, 140.0
 
         def __init__(self, pill):
@@ -957,7 +960,7 @@ try:
             """Showcase: play every gesture once, back to back."""
             order = ["listening", "thinking", "angry", "droop", "drift",
                      "eyeroll", "focus", "gleam", "doubletake",
-                     "stretch", "nuzzle", "hearteyes",
+                     "stretch", "nuzzle", "hearteyes", "dizzy", "frazzle", "disco",
                      "wake", "alert", "happy", "sad", "love",
                      "stressed", "glow", "skeptic", "blink",
                      "glance", "look_left", "look_right", "nod", "shake",
