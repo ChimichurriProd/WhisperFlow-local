@@ -598,6 +598,14 @@ class MenuBarApp(rumps.App):
         for val, label in (("marvin", "Marvin"), ("waveform", "Waveform")):
             add(label, (lambda v=val: self.set_pill_style(v)), look_sub,
                 state=(val == cur_style))
+        if cur_style == "marvin":
+            look_sub.addItem_(NSMenuItem.separatorItem())
+            cur_skin = self.config.get("ui", {}).get("marvin_skin", "B")
+            for key, label in (("B", "Skin: B — Stoned"),
+                               ("A", "Skin: A — Clean"),
+                               ("G", "Skin: G — Plush")):
+                add(label, (lambda k=key: self._apply_skin(k)), look_sub,
+                    state=(key == cur_skin))
 
         # Preview all animations we've got.
         if self.pill is not None and getattr(self.pill, "clips", None):
