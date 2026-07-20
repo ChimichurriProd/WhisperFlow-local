@@ -427,6 +427,123 @@ def test_face_back_is_noop_without_back_face():
     assert s._face_target == 0.0     # stays facing front
 
 
+def test_model_cycle_pops_marvins_firefly():
+    """Switching model pops Marvin's firefly orb (flare ring); re-setting
+    the same model (or a non-marvin style) does not."""
+    from app import pill as P
+
+    Pill = getattr(P, "_Pill", None)
+    if Pill is None:
+        pytest.skip("AppKit unavailable: _Pill not defined")
+
+    class Stub:
+        style = "marvin"
+        model = "small"
+        _orb_pop = 0.0
+
+        def _render(self):
+            pass
+
+    s = Stub()
+    s.set_model = Pill.set_model.__get__(s)
+    s.set_model("medium")                 # a real switch -> flare
+    assert s.model == "medium"
+    assert s._orb_pop == 1.0
+
+    s._orb_pop = 0.0
+    s.set_model("medium")                 # same model again -> quiet
+    assert s._orb_pop == 0.0
+
+    s.style = "waveform"                  # waveform pill has its own dot
+    s.set_model("base")
+    assert s._orb_pop == 0.0
+
+
+def test_orb_orbit_is_a_3d_path_around_the_head():
+    """The firefly's orbit: z sweeps front (+1) to back (-1); the plane is
+    seen slightly from above so the front pass crosses below centre and the
+    back pass above; a full lap stays on the canvas."""
+    import math
+
+    from app.pill import _orb_orbit
+
+    w = 280.0
+    front = _orb_orbit(0.0, math.pi / 2.0, w)
+    back = _orb_orbit(0.0, 3.0 * math.pi / 2.0, w)
+    assert front[2] == pytest.approx(1.0)
+    assert back[2] == pytest.approx(-1.0)
+    assert front[1] > back[1]                 # below centre vs above centre
+    for i in range(200):
+        x, y, z = _orb_orbit(i * 0.31, i * math.pi / 25.0, w)
+        assert 0.0 <= x <= w and 0.0 <= y <= w
+        assert -1.0 <= z <= 1.0
+
+
+def _orb_stub():
+    """Bind the real _Pill orb logic to a bare stub (no AppKit window)."""
+    import math
+
+    from app import pill as P
+
+    Pill = getattr(P, "_Pill", None)
+    if Pill is None:
+        pytest.skip("AppKit unavailable: _Pill not defined")
+
+    class Stub:
+        pass
+
+    s = Stub()
+    s.style = "marvin"
+    s._anim = 0.0
+    s._w = 280.0
+    s._orb_theta = math.pi / 2.0      # right out front (z = +1)
+    s._orb_pos = None
+    s._orb_trail = []
+    s._orb_event = None
+    s._orb_notice_t = 10**9
+    s._orb_swallow_t = 10**9
+    s._orb_pop = 0.0
+    s._oneshot = None
+    s.clips = {}
+    s._idle_gestures = []
+    s.played = []
+    s.play_oneshot = s.played.append
+    s._tick_orb = Pill._tick_orb.__get__(s)
+    s._orb_notice = Pill._orb_notice.__get__(s)
+    return s
+
+
+def test_orb_swallow_digest_respawn_cycle():
+    """The swallow event: orb spirals in (scale -> 0), Marvin digests it
+    (orb gone), then it pops back out onto its orbit with a flare."""
+    s = _orb_stub()
+    s._orb_swallow_t = 1              # about to fire, orb already out front
+    s._tick_orb("idle")
+    assert s._orb_event and s._orb_event[0] == "swallow"
+    assert s._orb_swallow_t > 1       # re-armed for next time
+    for _ in range(30):
+        s._tick_orb("idle")
+    assert s._orb_event[0] == "digest"
+    assert s._orb_pos is None         # the orb is inside him
+    assert s._orb_trail == []
+    for _ in range(36):
+        s._tick_orb("idle")
+    assert s._orb_event is None       # popped back out...
+    assert s._orb_pop == 1.0          # ...with a flare
+    s._tick_orb("idle")
+    assert s._orb_pos is not None     # orbiting again
+
+
+def test_orb_notice_prefers_watchful_gesture_and_only_fires_idle():
+    s = _orb_stub()
+    s.clips = {"eyeroll": [0], "angry": [0]}
+    s._orb_notice_t = 1
+    s._tick_orb("recording")          # busy: the timer must not fire
+    assert s.played == []
+    s._tick_orb("idle")
+    assert s.played == ["eyeroll"]    # B's deadpan look-at-it gesture
+
+
 def test_ask_start_signal_fires_for_ask_only():
     from app.config import load_config as _lc
     from app.hotkey import PushToTalkApp

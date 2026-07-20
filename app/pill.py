@@ -10,6 +10,15 @@ States:
 - recording:    expands, gradient waveform driven by mic level
 - transcribing: a gentle animated shimmer ("thinking")
 
+Marvin (pill_style "marvin") shows the active STT model as a magical
+"firefly": a small glowing orb orbiting his head in 3D — behind him it
+shrinks, dims and is occluded by the head; in front it passes over his face,
+its light faintly washing over him. Colour+size step blue/small (base) to
+red/big (large), the same language as the waveform idle dot, so it works
+across every skin without per-model clips. Cycling the model pops the orb
+with a flare ring. While resting he occasionally notices it — and once in a
+while swallows it, his head pulsing in its colour until it pops back out.
+
 All AppKit objects are created/mutated on the main thread only. If PyObjC UI
 isn't available, create_pill() returns None and the app still works headlessly.
 """
@@ -50,6 +59,28 @@ def _ease_toward(cur, target, speed):
     if cur > target:
         return max(target, cur - speed)
     return cur
+
+
+def _orb_orbit(t, theta, w):
+    """Screen position + depth of the model firefly on its tilted 3D orbit
+    around Marvin's head (treated as a ball at the canvas centre). Returns
+    (x, y, z) with z in [-1, 1]: negative = behind the head (drawn first so
+    the opaque head occludes it, smaller and dimmer), positive = in front
+    (drawn over his face, slightly larger). The orbit plane is seen a little
+    from above, so the front pass crosses below centre and the back pass
+    above. Radius, tilt and height all breathe on slow incommensurate sines
+    so the path never repeats exactly — organic, not mechanical. Module
+    scope (outside the AppKit import) so it's testable headlessly."""
+    cx = cy = w / 2.0
+    rx = w * (0.150 + 0.018 * math.sin(t * 0.37))
+    # steeper tilt + a small downward shift keep the front pass at his chin
+    # instead of crossing his eyes (reads as an artefact when over the face)
+    tilt = 0.48 + 0.10 * math.sin(t * 0.23 + 2.0)
+    bob = w * 0.012 * math.sin(t * 0.53 + 1.0)
+    z = math.sin(theta)
+    x = cx + rx * math.cos(theta)
+    y = cy + w * 0.012 + bob + rx * tilt * z
+    return x, y, z
 
 # Per-STT-model idle loop clips: when assets/marvin/<clip>/ exists for the
 # active model, Marvin's resting loop plays it. The v3 set ships ONE shared
@@ -326,10 +357,16 @@ try:
             h = self.frame().size.height
 
             if c.style == "marvin":
+                # The firefly orbits in 3D: its behind-the-head pass draws
+                # first (so the opaque head occludes it), the head next, then
+                # the in-front pass on top.
                 if c.clips or c.center is not None:
+                    self._draw_orb_layer(c, w, h, behind=True)
                     self._draw_marvin_image(c, w, h)  # video flipbook / still
+                    self._draw_orb_layer(c, w, h, behind=False)
                     return
                 # fallback (no assets): 2D fake tilt/nod on the vector face
+                self._draw_orb_layer(c, w, h, behind=True)
                 NSGraphicsContext.saveGraphicsState()
                 t = NSAffineTransform.transform()
                 t.translateXBy_yBy_(0.0, c.nod)
@@ -339,6 +376,7 @@ try:
                 t.concat()
                 self._draw_marvin_vector(c, w, h)
                 NSGraphicsContext.restoreGraphicsState()
+                self._draw_orb_layer(c, w, h, behind=False)
                 return
 
             # subtle dark tint over the frosted glass for contrast + a hairline
@@ -457,6 +495,124 @@ try:
                 self._eye_glow(rx, ry, rw, rh, c.back_eyes, level,
                                rgb=_BACK_EYE_RGB)
                 NSGraphicsContext.restoreGraphicsState()
+
+        @objc.python_method
+        def _orb_dot(self, x, y, r, rgb, a):
+            """A magical firefly point: layered soft halos around a hot,
+            whitened core, all scaled by alpha *a* so depth/trail fading
+            keeps the same look."""
+            cr, cg, cb = rgb
+            for scale, alpha in ((3.4, 0.08), (1.9, 0.20), (1.0, 0.90)):
+                _rgb(cr, cg, cb, min(1.0, alpha * a)).setFill()
+                NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect(x - r * scale, y - r * scale,
+                               2 * r * scale, 2 * r * scale)
+                ).fill()
+            hot = (cr + (1 - cr) * 0.75, cg + (1 - cg) * 0.75,
+                   cb + (1 - cb) * 0.75)
+            hr = r * 0.45
+            _rgb(*hot, min(1.0, 0.9 * a)).setFill()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(x - hr, y - hr, 2 * hr, 2 * hr)
+            ).fill()
+
+        @objc.python_method
+        def _draw_orb_layer(self, c, w, h, behind):
+            """One depth layer of the model firefly (path: _orb_orbit, state:
+            _tick_orb). The behind pass runs before the head is drawn so the
+            head occludes it; the front pass runs after, passing over his
+            face, and also casts the orb's light onto the head and renders
+            the post-swallow digest glow."""
+            if c._turn_f > 0.5:
+                return  # the oracle owns the stage while he's turned around
+            color, radius = _model_style(c.model)
+            ev = c._orb_event
+            if ev is not None and ev[0] == "digest":
+                if not behind:
+                    self._digest_glow(c, w, h, color, ev[1])
+                return
+            pos = c._orb_pos
+            if pos is None:
+                return
+            x, y, z, s = pos
+            # comet trail: oldest faintest, each sample on its own depth side
+            n = len(c._orb_trail)
+            for i, (tx, ty, tz, ts) in enumerate(c._orb_trail):
+                if (tz < 0.0) != behind:
+                    continue
+                fade = (i + 1) / (n + 1.0)
+                tr = radius * 0.85 * ts * (1.0 + 0.28 * tz) * 0.6 * fade
+                if tr > 0.3:
+                    self._orb_dot(tx, ty, tr, color, 0.22 * fade)
+            if (z < 0.0) == behind:
+                a = 0.45 + 0.55 * (z + 1.0) / 2.0     # dim when behind him
+                a *= 0.82 + 0.18 * math.sin(c._anim * 6.7)  # firefly twinkle
+                r = radius * 0.85 * s * (1.0 + 0.28 * z)
+                if c.mode == "recording" and c.levels:
+                    r *= 1.0 + 0.25 * max(0.0, min(1.0, c.levels[-1]))
+                r *= 1.0 + 0.8 * c._orb_pop
+                if r > 0.3:
+                    self._orb_dot(x, y, r, color, a)
+                if c._orb_pop > 0.02:
+                    # expanding ring acknowledging the model switch
+                    cr, cg, cb = color
+                    ring = r * (1.8 + (1.0 - c._orb_pop) * 3.0)
+                    _rgb(cr, cg, cb, 0.5 * c._orb_pop).setStroke()
+                    p = NSBezierPath.bezierPathWithOvalInRect_(
+                        NSMakeRect(x - ring, y - ring, 2 * ring, 2 * ring)
+                    )
+                    p.setLineWidth_(1.5)
+                    p.stroke()
+            if not behind:
+                self._orb_light(c, w, h, color, pos)
+
+        @objc.python_method
+        def _orb_light(self, c, w, h, color, pos):
+            """The orb's light falling on Marvin: a faint colour wash over
+            the head ball, centred on the orb and clipped to the head, so the
+            firefly reads as actually illuminating him. Subtle — ambience,
+            not a spotlight."""
+            x, y, z, s = pos
+            if s < 0.3:
+                return  # mostly swallowed: the digest glow takes over
+            cr, cg, cb = color
+            hr = w * 0.118                    # ~the head ball
+            # behind him the wash doubles as a faint rim light, so he still
+            # hints at the firefly while the head fully occludes it
+            a = (0.08 + 0.10 * (z + 1.0) / 2.0) * s
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(w / 2.0 - hr, h / 2.0 - hr, 2 * hr, 2 * hr)
+            ).addClip()
+            rad = w * 0.16
+            grad = NSGradient.alloc().initWithColors_([
+                _rgb(cr, cg, cb, a), _rgb(cr, cg, cb, 0.0)])
+            path = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(x - rad, y - rad, 2 * rad, 2 * rad))
+            grad.drawInBezierPath_relativeCenterPosition_(
+                path, NSMakePoint(0.0, 0.0))
+            NSGraphicsContext.restoreGraphicsState()
+
+        @objc.python_method
+        def _digest_glow(self, c, w, h, color, k):
+            """He swallowed the firefly: the whole head pulses softly in the
+            model colour for a moment before the orb pops back out."""
+            cr, cg, cb = color
+            pulse = 0.5 - 0.5 * math.cos(k * (2.0 * math.pi / 12.0))
+            a = 0.14 + 0.20 * pulse
+            hr = w * 0.118
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(w / 2.0 - hr, h / 2.0 - hr, 2 * hr, 2 * hr)
+            ).addClip()
+            rad = w * 0.14
+            grad = NSGradient.alloc().initWithColors_([
+                _rgb(cr, cg, cb, a), _rgb(cr, cg, cb, 0.0)])
+            path = NSBezierPath.bezierPathWithOvalInRect_(
+                NSMakeRect(w / 2.0 - rad, h / 2.0 - rad, 2 * rad, 2 * rad))
+            grad.drawInBezierPath_relativeCenterPosition_(
+                path, NSMakePoint(0.0, 0.0))
+            NSGraphicsContext.restoreGraphicsState()
 
         @objc.python_method
         def _eye_glow(self, rx, ry, rw, rh, eyes, glow, rgb=(0.60, 1.0, 0.45)):
@@ -694,6 +850,19 @@ try:
             self._prev_mode = "idle"
             self._oneshot = None       # a gesture clip playing once (wake/spin/react)
             self._oneshot_f = 0.0
+            # Model "firefly" switch feedback: _orb_pop = 1->0 flare of the
+            # orb, set on a model switch and decayed in tick().
+            self._orb_pop = 0.0
+            # Firefly orbit state (see _tick_orb / _orb_orbit): angle on the
+            # 3D path, latest (x, y, z, scale) sample, a short comet trail,
+            # and the rare idle-only events — Marvin noticing it, or
+            # swallowing it (phases "swallow" -> "digest" -> pop back out).
+            self._orb_theta = random.uniform(0.0, 2.0 * math.pi)
+            self._orb_pos = None
+            self._orb_trail = []
+            self._orb_event = None
+            self._orb_notice_t = random.randint(900, 2400)    # ~45-120 s idle
+            self._orb_swallow_t = random.randint(3600, 7200)  # ~3-6 min idle
             # Front/back persona turn: _turn_f is the current facing in spin-frame
             # units (0 = front scribe, _TURN_BACK = back oracle); _face_target is
             # where he's turning to. Equal => settled.
@@ -805,7 +974,10 @@ try:
             self._render()
 
         def set_model(self, model):
+            changed = model != self.model
             self.model = model
+            if changed and self.style == "marvin":
+                self._orb_pop = 1.0      # firefly flare acknowledging the switch
             self._render()
 
         def set_hover(self, value):
@@ -840,6 +1012,10 @@ try:
             self.mode = mode
             if self._showcase is not None and not self._showcase.tick():
                 self._showcase = None
+            # Decay the model-switch flare (~0.6 s). Runs before the oracle
+            # early-return so a switch can't leave it stuck.
+            if self._orb_pop > 0.0:
+                self._orb_pop = max(0.0, self._orb_pop - 0.08)
             if mode == "recording":
                 self.levels = self.levels[1:] + [max(0.03, level)]
             elif mode == "transcribing":
@@ -933,7 +1109,79 @@ try:
             else:
                 self._clip_f = 0.0
                 self._clip_dir = 1
+            self._tick_orb(mode)
             self._render()
+
+        def _tick_orb(self, mode):
+            """Advance the model firefly one 20 Hz tick: the organically
+            wobbling 3D orbit, the comet trail, and the rare idle-only events
+            (Marvin noticing it, or swallowing it). Skipped while he's turned
+            to the oracle (tick() returns before reaching this), so an event
+            can't run unseen behind his back."""
+            if self.style != "marvin":
+                return
+            t = self._anim
+            ev = self._orb_event
+            if ev is None:
+                # angular speed breathes on incommensurate sines: the firefly
+                # hurries, loiters, hurries — never a metronome. Always > 0.
+                sp = 0.032 * (1.0 + 0.45 * math.sin(t * 0.53 + 1.7)
+                              + 0.25 * math.sin(t * 1.31))
+                self._orb_theta = (self._orb_theta + sp) % (2.0 * math.pi)
+                x, y, z = _orb_orbit(t, self._orb_theta, self._w)
+                self._orb_pos = (x, y, z, 1.0)
+                if mode == "idle" and self._oneshot is None:
+                    self._orb_notice_t -= 1
+                    self._orb_swallow_t -= 1
+                    # both events wait for the orb to be out front where the
+                    # story reads: he reacts to something he can see.
+                    if self._orb_swallow_t <= 0 and z > 0.45:
+                        self._orb_event = ["swallow", 0, x, y]
+                        self._orb_swallow_t = random.randint(3600, 7200)
+                    elif self._orb_notice_t <= 0 and z > 0.3:
+                        self._orb_notice()
+                        self._orb_notice_t = random.randint(900, 2400)
+            elif ev[0] == "swallow":
+                # spiral from the orbit into his mouth over ~1.5 s
+                ev[1] += 1
+                p = min(1.0, ev[1] / 30.0)
+                e = p * p                      # ease-in: the pull accelerates
+                mx = self._w / 2.0
+                my = self._w / 2.0 + self._w * 0.062   # his mouth area
+                ang = self._orb_theta + p * 7.0        # tightening spiral
+                wob = (1.0 - p) * self._w * 0.022
+                self._orb_pos = (
+                    ev[2] + (mx - ev[2]) * e + math.cos(ang) * wob,
+                    ev[3] + (my - ev[3]) * e + math.sin(ang) * wob * 0.6,
+                    1.0, 1.0 - p,
+                )
+                if p >= 1.0:
+                    self._orb_event = ["digest", 0]
+                    self._orb_pos = None
+                    self._orb_trail = []
+            elif ev[0] == "digest":
+                # ~1.8 s of head pulsing in the orb's colour (_digest_glow),
+                # then it pops back out onto its orbit with a flare.
+                ev[1] += 1
+                if ev[1] >= 36:
+                    self._orb_event = None
+                    self._orb_pop = 1.0
+            if self._orb_pos is not None:
+                self._orb_trail.append(self._orb_pos)
+                if len(self._orb_trail) > 8:
+                    self._orb_trail.pop(0)
+
+        def _orb_notice(self):
+            """Marvin clocks his firefly as it crosses in front of him: play
+            the most watchful gesture this skin has (deadpan eyeroll for B,
+            doubletake for A, ...), falling back to any idle gesture."""
+            for name in ("doubletake", "glance", "skeptic", "curious",
+                         "focus", "eyeroll"):
+                if name in self.clips:
+                    self.play_oneshot(name)
+                    return
+            if self._idle_gestures:
+                self.play_oneshot(random.choice(self._idle_gestures))
 
         def play_oneshot(self, name):
             """Trigger a gesture clip to play through once (no-op if absent)."""
