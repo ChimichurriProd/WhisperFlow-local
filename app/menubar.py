@@ -8,6 +8,7 @@ primary UI; the menu-bar title is a compact text fallback.
 
 import json
 import os
+from pathlib import Path
 
 import rumps
 from AppKit import NSMenu, NSMenuItem
@@ -45,6 +46,25 @@ class _MenuTarget(NSObject):
 ICONS = {"idle": "Flow", "recording": "● Rec", "transcribing": "Flow…",
          "paused": "Flow ‖", "blocked": "Flow ⚠"}
 
+# When the Marvin-face icon is showing, the title is just a compact state
+# marker beside it (empty when idle — the face alone means "running").
+ICON_TITLES = {"idle": "", "recording": "● Rec", "transcribing": "…",
+               "paused": "‖", "blocked": "⚠"}
+
+
+def _skin_icon(skin=None):
+    """Menu-bar icon: the active Marvin skin's resting face (center.png).
+    Mirrors pill._marvin_dir's layout — assets/marvin/ is the default skin,
+    alternates live in assets/marvin/_skins/<name>/. rumps renders it at
+    20x20pt but keeps the full-res backing, so it stays crisp on retina."""
+    base = Path(__file__).resolve().parent.parent / "assets" / "marvin"
+    if skin:
+        cand = base / "_skins" / str(skin) / "center.png"
+        if cand.exists():
+            return str(cand)
+    p = base / "center.png"
+    return str(p) if p.exists() else None
+
 # Model choices shown in the Model submenu: (config value, human label).
 # On the GPU (mlx) all are fast; the trade is accuracy, not speed.
 MODEL_CHOICES = [
@@ -57,7 +77,22 @@ MODEL_CHOICES = [
 
 class MenuBarApp(rumps.App):
     def __init__(self, config, config_path=None):
-        super().__init__(ICONS["idle"], quit_button=None)
+        # Marvin's face in the menu bar = "the app is alive". Falls back to
+        # the plain "Flow" text titles if the asset is missing.
+        # NOTE: macOS 26 (Tahoe) never hosts status items from python
+        # processes (Apple bug FB21015611), so this item is invisible there —
+        # the MarvinBar companion below is the visible indicator instead.
+        icon = _skin_icon(config.get("ui", {}).get("marvin_skin"))
+        super().__init__("WhisperFlow", icon=icon, quit_button=None)
+        self._has_icon = icon is not None
+
+        # Launch the native menu-bar companion (dimmed face = engine dead,
+        # menu offers restart/force-quit even when this process hangs).
+        # `open -g` is a no-op if it's already running.
+        companion = Path.home() / "Applications" / "MarvinBar.app"
+        if companion.exists():
+            import subprocess
+            subprocess.Popen(["/usr/bin/open", "-g", str(companion)])
         self.config = config
         self.config_path = config_path
         binding = config["hotkey"]["push_to_talk"]
@@ -193,7 +228,8 @@ class MenuBarApp(rumps.App):
                     self.pill.face_front()
 
         mode = self._mode
-        title = ICONS.get(mode, ICONS["idle"])
+        titles = ICON_TITLES if self._has_icon else ICONS
+        title = titles.get(mode, titles["idle"])
         if self.title != title:
             self.title = title
 
@@ -303,6 +339,10 @@ class MenuBarApp(rumps.App):
             item.state = 1 if k == key else 0
         if self.pill is not None and hasattr(self.pill, "set_skin"):
             self.pill.set_skin(key)
+        new_icon = _skin_icon(key)  # menu-bar face follows the skin
+        if new_icon is not None:
+            self.icon = new_icon
+            self._has_icon = True
         self._save_config()
 
     def _make_lang_cb(self, code):

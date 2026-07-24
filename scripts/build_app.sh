@@ -27,12 +27,14 @@ mkdir -p "$MACOS" "$RES"
 
 # Launcher: exec the venv Python running the menu-bar app, from the repo root.
 # All output is teed to a log so failures under LaunchServices are visible.
+# -u: unbuffered stdout — otherwise Python block-buffers to the log file and
+# a crash/kill loses everything still sitting in the buffer.
 LOG_DIR="$HOME/Library/Logs/whisperflow-local"
 mkdir -p "$LOG_DIR"
 cat > "$MACOS/WhisperFlow" <<EOF
 #!/bin/bash
 cd "$ROOT"
-exec "$PYTHON" -m app --menubar >> "$LOG_DIR/app.log" 2>&1
+exec "$PYTHON" -u -m app --menubar >> "$LOG_DIR/app.log" 2>&1
 EOF
 chmod +x "$MACOS/WhisperFlow"
 
