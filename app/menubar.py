@@ -145,6 +145,14 @@ class MenuBarApp(rumps.App):
         )
         self.listener = self.engine.build_listener()
         self.listener.start()
+        # Hands-free "Hey Marvin" (opt-in; a no-op when switched off).
+        self.engine.start_wakeword()
+        # Load the lazy models NOW instead of on first use. While this runs,
+        # _drive_pill greys Marvin's model orb and swaps the status line, so
+        # "still loading" never reads as "crashed".
+        self._warming_shown = False
+        self._status_ready = f"Hold {binding} to dictate"
+        self.engine.prewarm()
         self._paused = False  # dictation paused via engine flag (not by stopping)
 
         # Floating pill = the primary UI. Driven by a main-thread timer that
@@ -175,7 +183,7 @@ class MenuBarApp(rumps.App):
         self._speak_lock = threading.Lock()
         try:
             from .tts import Speaker
-            self._speaker = Speaker()
+            self._speaker = Speaker.from_config(config.get("tts"))
         except Exception:
             self._speaker = None
         if self._speaker is not None and config.get("ui", {}).get(
@@ -233,6 +241,17 @@ class MenuBarApp(rumps.App):
         if self.title != title:
             self.title = title
 
+        # Model prewarm cue: grey pulsing orb + status line while loading,
+        # flare + normal line when ready. Driven here because AppKit (pill,
+        # menu items) must only be touched on the main thread.
+        warming = getattr(self.engine, "warming", False)
+        if warming != self._warming_shown:
+            self._warming_shown = warming
+            self.status_item.title = (
+                "Loading speech models…" if warming else self._status_ready)
+            if self.pill is not None and hasattr(self.pill, "set_warming"):
+                self.pill.set_warming(warming)
+
         if self.pill is None:
             return
         # blocked shows as idle; paused = Marvin dozes off (sleep clip), else idle.
@@ -244,8 +263,10 @@ class MenuBarApp(rumps.App):
             pill_mode = mode
         level = self.engine.recorder.level if pill_mode == "recording" else 0.0
         # Waveform idle costs nothing once settled; Marvin keeps a subtle idle
-        # bob so he always looks a little alive.
+        # bob so he always looks a little alive. Keep ticking while warming,
+        # though — the grey orb's breathing pulse needs the animation clock.
         if (pill_mode == "idle" and self.pill.style != "marvin"
+                and not self._warming_shown
                 and not self.pill.hover
                 and not any(v > 0.001 for v in self.pill.levels)):
             return
@@ -265,6 +286,21 @@ class MenuBarApp(rumps.App):
 
     _LANGUAGES = [("Auto-detect", None), ("Svenska", "sv"),
                   ("English", "en"), ("Español", "es")]
+
+    # Which KB-Whisper (Swedish-specialist STT) handles Swedish, if any. With
+    # the language on auto-detect this is a second decode on Swedish
+    # utterances only — see stt.Transcriber._transcribe_mlx.
+    _SWEDISH_MODELS = [("KB-Whisper large — best Swedish", "kb-large"),
+                       ("KB-Whisper small — quicker", "kb-small"),
+                       ("Off — one model for every language", None)]
+
+    # Marvin's spoken/answer language ("tts.language"): forces BOTH the Ollama
+    # answer language (answer.py appends a hard override — small models drift
+    # into English on their own) and the TTS route for answers. "auto" = mirror
+    # the question and guess the TTS language from the answer text. Quips are
+    # a fixed English asset and ignore this.
+    _MARVIN_LANGS = [("Match the question", "auto"), ("Svenska", "sv"),
+                     ("English", "en"), ("Español", "es")]
 
     _HOTKEYS = [
         ("right command", "Right ⌘  (hold, one thumb) — easiest"),
@@ -291,6 +327,16 @@ class MenuBarApp(rumps.App):
             lang_menu.add(it)
         menu.add(lang_menu)
 
+        sv_menu = rumps.MenuItem("Swedish model")
+        self._sv_items = {}
+        current_sv = self.config["stt"].get("swedish_model")
+        for label, key in self._SWEDISH_MODELS:
+            it = rumps.MenuItem(label, callback=self._make_sv_cb(key))
+            it.state = 1 if key == current_sv else 0
+            self._sv_items[key] = it
+            sv_menu.add(it)
+        menu.add(sv_menu)
+
         self._cleanup_item = rumps.MenuItem(
             "AI cleanup", callback=self._toggle_cleanup
         )
@@ -315,6 +361,24 @@ class MenuBarApp(rumps.App):
         )
         self._ask_voice_item.state = 1 if self.config.get("ask", {}).get("voice", True) else 0
         menu.add(self._ask_voice_item)
+
+        wake = self.config.get("wakeword", {})
+        self._wake_item = rumps.MenuItem(
+            f'Hands-free ("{wake.get("phrase", "Hey Marvin")}")',
+            callback=self._toggle_wakeword,
+        )
+        self._wake_item.state = 1 if wake.get("enabled", False) else 0
+        menu.add(self._wake_item)
+
+        mlang_menu = rumps.MenuItem("Marvin's language")
+        self._mlang_items = {}
+        current_mlang = (self.config.get("tts") or {}).get("language", "auto")
+        for label, code in self._MARVIN_LANGS:
+            it = rumps.MenuItem(label, callback=self._make_mlang_cb(code))
+            it.state = 1 if code == current_mlang else 0
+            self._mlang_items[code] = it
+            mlang_menu.add(it)
+        menu.add(mlang_menu)
 
         skin_menu = rumps.MenuItem("Marvin skin")
         self._skin_items = {}
@@ -347,6 +411,27 @@ class MenuBarApp(rumps.App):
 
     def _make_lang_cb(self, code):
         return lambda _sender: self._apply_language(code)
+
+    def _make_sv_cb(self, key):
+        return lambda _sender: self._apply_swedish_model(key)
+
+    def _apply_swedish_model(self, key):
+        self.engine.set_swedish_model(key)
+        for k, item in self._sv_items.items():
+            item.state = 1 if k == key else 0
+        self._save_config()
+
+    def _make_mlang_cb(self, code):
+        return lambda _sender: self._apply_marvin_language(code)
+
+    def _apply_marvin_language(self, code):
+        """Set the language Marvin answers and speaks in (tts.language).
+        Takes effect on the next question — no engine restart needed, since
+        answer.py and _show_answer read it from config per call."""
+        self.config.setdefault("tts", {})["language"] = code
+        for c, item in self._mlang_items.items():
+            item.state = 1 if c == code else 0
+        self._save_config()
 
     # Setters: single source of truth so the menu-bar Settings items and the
     # pill's right-click menu stay in sync.
@@ -397,10 +482,14 @@ class MenuBarApp(rumps.App):
         self._pending_answer = (question, answer)
 
     def _speakable(self, text):
-        """Kokoro TTS is English-only. Gate on the ANSWER text (not the STT-
-        detected question language, which is easy to mis-detect on short
-        utterances): Swedish letters mean 'don't voice this', so it stays
+        """With Chatterbox in the engine mix (tts.engine "auto"/"chatterbox")
+        Marvin voices Swedish too, so everything is speakable. Only the forced
+        "kokoro" engine keeps the old English-only gate on the ANSWER text (not
+        the STT-detected question language, which is easy to mis-detect on
+        short utterances): Swedish letters mean 'don't voice this', so it stays
         text-only in the bubble."""
+        if (self.config.get("tts") or {}).get("engine", "auto") != "kokoro":
+            return True
         return not any(c in "åäöÅÄÖ" for c in (text or ""))
 
     def _on_ask_start(self):
@@ -437,9 +526,13 @@ class MenuBarApp(rumps.App):
         # reaction, and a front clip would be invisible while he's turned away.)
 
         if self.config.get("ask", {}).get("voice", True) and self._speakable(answer):
-            self._speak_text(answer)
+            # A fixed Marvin's-language choice rides along to TTS, so even a
+            # short answer with no obvious language markers ("Montevideo.")
+            # is spoken in the chosen language's voice.
+            mlang = (self.config.get("tts") or {}).get("language", "auto")
+            self._speak_text(answer, lang=None if mlang == "auto" else mlang)
 
-    def _speak_text(self, text, drop_if_busy=False):
+    def _speak_text(self, text, drop_if_busy=False, lang=None):
         """Speak *text* in Marvin's voice on a daemon thread. Playback is
         serialized by _speak_lock so two lines never overlap: answers wait their
         turn; ambient quips pass drop_if_busy=True to skip while he's speaking.
@@ -452,20 +545,46 @@ class MenuBarApp(rumps.App):
         if self._speaker is None:
             try:
                 from .tts import Speaker
-                self._speaker = Speaker()
+                self._speaker = Speaker.from_config(self.config.get("tts"))
             except Exception:
                 self._speaker = None
                 return
 
         def _run():
             with self._speak_lock:  # answers queue behind a quip instead of dropping
+                # Barge-in: stay listening while he talks so "Hey Marvin" can
+                # cut him off (see engine.set_speaking). Energy-based barge-in
+                # would need echo cancellation we don't have — the mic hears
+                # his own voice from the speakers — but the wake phrase is
+                # specific enough to be safe, and he never says it himself.
+                self.engine.set_speaking(True, self._speaker)
                 try:
-                    self._speaker.speak(text)
+                    self._speaker.speak(text, lang=lang)
                 except Exception as exc:  # never let TTS crash the app
                     print(f"[marvin] speak failed: {exc!r}", flush=True)
+                finally:
+                    self.engine.set_speaking(False, None)
 
         import threading
         threading.Thread(target=_run, daemon=True).start()
+
+    def _toggle_wakeword(self, sender):
+        self._apply_wakeword(not bool(sender.state))
+
+    def _apply_wakeword(self, enabled):
+        """Switch hands-free "Hey Marvin" on or off. If the model can't load,
+        fall straight back to off rather than leaving a dead toggle on."""
+        wake = self.engine.set_wakeword_enabled(enabled)
+        if enabled and wake is None:
+            enabled = False
+            self.config.setdefault("wakeword", {})["enabled"] = False
+            rumps.notification(
+                "WhisperFlow", "Hands-free unavailable",
+                "No wake-word model is installed — see scripts/train_wakeword.sh",
+            )
+        if getattr(self, "_wake_item", None) is not None:
+            self._wake_item.state = 1 if enabled else 0
+        self._save_config()
 
     def _apply_ask_enabled(self, enabled):
         self.engine.set_ask_enabled(enabled)
@@ -632,6 +751,11 @@ class MenuBarApp(rumps.App):
         for label, code in self._LANGUAGES:
             add(label, (lambda c=code: self._apply_language(c)), lang_sub,
                 state=(code == cur_lang))
+        lang_sub.addItem_(NSMenuItem.separatorItem())
+        cur_sv = self.config["stt"].get("swedish_model")
+        for label, key in self._SWEDISH_MODELS:
+            add(label, (lambda k=key: self._apply_swedish_model(k)), lang_sub,
+                state=(key == cur_sv))
 
         cur_style = self.config.get("ui", {}).get("pill_style", "waveform")
         look_sub = submenu("Appearance")
@@ -698,6 +822,14 @@ class MenuBarApp(rumps.App):
             lambda: self._apply_ask_enabled(not ask_on), menu, state=ask_on)
         add("Speak answers", lambda: self._apply_ask_voice(not ask_voice), menu,
             state=ask_voice)
+        wake = self.config.get("wakeword", {})
+        wake_on = wake.get("enabled", False)
+        add(f'Hands-free  ("{wake.get("phrase", "Hey Marvin")}")',
+            lambda: self._apply_wakeword(not wake_on), menu, state=wake_on)
+        turns = len(getattr(self.engine, "_turns", [])) // 2
+        add(f"New conversation  ({turns} turn{'' if turns == 1 else 's'} remembered)",
+            lambda: self.engine.reset_conversation(), menu,
+            enabled=turns > 0)
         add("Ask Marvin…", lambda: self._ask_prompt(), menu)
 
         cleanup_on = self.config["cleanup"].get("enabled", True)

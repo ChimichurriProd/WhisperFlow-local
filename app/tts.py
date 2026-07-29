@@ -1,23 +1,35 @@
 """Text-to-speech: give Marvin a local voice.
 
-Kokoro-82M via **kokoro-onnx** (onnxruntime, Apache-2.0 weights). Fully local
-and offline once the model files are cached. Chosen over mlx-audio because the
-MLX Kokoro vocoder in mlx-audio 0.4.4 fails on ~10-20% of inputs
-("broadcast_shapes ..."); the ONNX engine is reliable on the same model/voices.
+Two engines, routed per line by the "auto" default:
+
+- **Kokoro-82M** via kokoro-onnx (onnxruntime, Apache-2.0 weights). Instant on
+  CPU, prerendered quips, English only. Chosen over mlx-audio's Kokoro because
+  that MLX vocoder (0.4.4) fails on ~10-20% of inputs ("broadcast_shapes ...");
+  the ONNX engine is reliable on the same model/voices.
+- **Chatterbox Multilingual** via mlx-audio (MLX, Apple-Silicon GPU): Swedish
+  + 22 other languages, zero-shot voice cloning from ~10s of reference audio
+  (tts.voice_ref in config). ~1.4GB weights, loaded lazily on first non-English
+  line; roughly real-time synthesis, so answers speak a few seconds after the
+  bubble shows.
+
+"auto" keeps English on Kokoro (instant, cached) and sends everything else to
+Chatterbox — the only engine here that speaks Swedish. Any Chatterbox failure
+falls back to Kokoro so Marvin is never mute; two consecutive failures disable
+Chatterbox for the session (same idiom as stt.py's mlx fallback).
 
 Standalone — deliberately NOT wired into the record -> transcribe -> inject
 dictation flow. It exists so Marvin *can* speak, and so you can test it:
 
     python -m app.tts "Hello, I am Marvin. I think you will be underwhelmed."
+    python -m app.tts "Hej! Jag är Marvin. Försök att inte bli besviken."
     python -m app.tts --list-voices
     python -m app.tts "test one two three" --save /tmp/marvin.wav
-
-Kokoro speaks English (US/UK) + a few other languages — NOT Swedish.
 """
 
 import concurrent.futures
 import os
 import random
+import threading
 import wave
 
 # Model files (downloaded once to this cache dir on first use).
@@ -37,6 +49,38 @@ _DEFAULT_VOICE = "bm_lewis"
 # Pitch is applied as an output-rate multiplier (raises pitch, slightly quickens
 # tempo). 1.0 = natural; 1.35 = Marvin's cartoon default.
 _DEFAULT_PITCH = 1.35
+
+# Chatterbox Multilingual on MLX. This community conversion is the one that
+# ships conds.safetensors (a built-in default voice), so tts.voice_ref stays
+# optional. Weights auto-download to the HF cache on first use.
+_DEFAULT_CB_MODEL = "theoracleguy/Chatterbox-Multilingual-MLX-v2-fp16"
+
+# Swedish/Spanish/English guess for the "auto" engine route. Accented letters
+# are near-certain signals; otherwise distinctive function words are counted
+# ("de"/"en" are deliberately absent — they're common in both languages).
+_SV_WORDS = frozenset(
+    "och är jag det att inte du på med som har för till vad hej "
+    "ett den vi ni han hon".split()
+)
+_ES_WORDS = frozenset(
+    "que el los las una está pero cómo gracias hola muy bien sí "
+    "para por con esto eso usted yo".split()
+)
+
+
+def _guess_lang(text):
+    """Return "sv", "es" or "en" for the auto engine route (cheap heuristic)."""
+    text = text or ""
+    if any(c in "åäöÅÄÖ" for c in text):
+        return "sv"
+    if any(c in "ñ¿¡áéíóúÑ" for c in text):
+        return "es"
+    words = [w.strip(".,!?;:\"'()").lower() for w in text.split()]
+    sv = sum(1 for w in words if w in _SV_WORDS)
+    es = sum(1 for w in words if w in _ES_WORDS)
+    if sv == es == 0:
+        return "en"
+    return "sv" if sv >= es else "es"
 
 # Kokoro voice presets (English shown; other languages exist too).
 _VOICES = {
@@ -95,6 +139,10 @@ _QUIPS = [
 ]
 
 
+_KOKORO_LANGS = frozenset(
+    ["en-us", "en-gb", "es", "fr-fr", "hi", "it", "pt-br", "ja", "cmn"])
+
+
 def _lang_for_voice(voice):
     """Kokoro voice prefix -> kokoro-onnx language tag."""
     return {"a": "en-us", "b": "en-gb", "e": "es", "f": "fr-fr", "h": "hi",
@@ -118,21 +166,48 @@ def _ensure_models():
 
 
 class Speaker:
-    """Synthesizes speech with Kokoro (ONNX) and optionally plays it. The model
-    loads lazily and is cached in memory after the first call."""
+    """Synthesizes speech (Kokoro and/or Chatterbox, see module docstring) and
+    optionally plays it. Models load lazily and are cached in memory."""
 
-    def __init__(self, voice=_DEFAULT_VOICE, speed=1.0, pitch=_DEFAULT_PITCH):
+    def __init__(self, voice=_DEFAULT_VOICE, speed=1.0, pitch=_DEFAULT_PITCH,
+                 engine="auto", chatterbox_model=_DEFAULT_CB_MODEL,
+                 voice_ref=None, exaggeration=0.3):
         self.voice = voice
         self.speed = speed
         self.pitch = pitch  # output-rate multiplier applied on play/save
+        self.engine = engine  # "auto" | "kokoro" | "chatterbox"
+        self.chatterbox_model = chatterbox_model
+        self.voice_ref = voice_ref      # WAV to clone (None = built-in voice)
+        self.exaggeration = exaggeration  # chatterbox emotion 0-1
         self._model = None
+        self._cb = None         # chatterbox model (lazy, ~1.4GB on the GPU)
+        self._cb_conds = None   # cloned-voice conditionals from voice_ref
+        self._cb_fails = 0      # consecutive failures -> disable for session
         # One persistent worker thread for all synthesis (keeps the onnx session
-        # single-threaded and makes this safe to call from other threads later).
+        # single-threaded, MLX models thread-affine, and makes this safe to call
+        # from other threads).
         self._pool = None
         # text -> (audio, sr) cache for default-voice renders (see prerender),
         # so repeat/pre-rendered lines play instantly with no synth at call time.
         self._cache = {}
         self._playing = False  # true while audio is on the speaker (prerender waits)
+        # Barge-in: the running afplay process, and a flag that stops the
+        # streaming loop from starting the next sentence once interrupted.
+        self._proc = None
+        self._interrupted = threading.Event()
+
+    @classmethod
+    def from_config(cls, cfg):
+        """Build a Speaker from the config.json "tts" section (missing keys
+        fall back to the same defaults as the constructor)."""
+        cfg = cfg or {}
+        return cls(
+            pitch=cfg.get("pitch", _DEFAULT_PITCH),
+            engine=cfg.get("engine", "auto"),
+            chatterbox_model=cfg.get("chatterbox_model", _DEFAULT_CB_MODEL),
+            voice_ref=cfg.get("voice_ref"),
+            exaggeration=cfg.get("exaggeration", 0.3),
+        )
 
     def _executor(self):
         if self._pool is None:
@@ -156,6 +231,10 @@ class Speaker:
         never starves live playback (which would sound choppy)."""
         import time
 
+        if self.engine == "chatterbox":
+            # Forced-chatterbox mode synths live: pre-rendering the whole quip
+            # list at ~real-time would churn the GPU for minutes at startup.
+            return
         for t in texts:
             if t in self._cache:
                 continue
@@ -172,7 +251,77 @@ class Speaker:
             self._run_synth, text, voice, speed, lang
         ).result()
 
+    def _engine_for(self, text, voice, lang):
+        """Pick the engine for one line. An explicit Kokoro voice preset always
+        means Kokoro; otherwise "auto" keeps English on Kokoro (instant, cached
+        quips) and routes everything else to Chatterbox."""
+        if voice is not None or self.engine == "kokoro" or self._cb_fails >= 2:
+            return "kokoro"
+        if self.engine == "chatterbox":
+            return "chatterbox"
+        code = (lang or _guess_lang(text)).split("-")[0].lower()
+        return "kokoro" if code == "en" else "chatterbox"
+
     def _run_synth(self, text, voice, speed, lang):
+        if self._engine_for(text, voice, lang) == "chatterbox":
+            out = self._synth_chatterbox(text, lang)
+            if out is not None:
+                return out
+            # fall through to Kokoro so Marvin is never mute (Swedish text will
+            # sound accented through the English voice, but it plays)
+        return self._synth_kokoro(text, voice, speed, lang)
+
+    # -------------------------------------------------- chatterbox (MLX, GPU)
+
+    def _synth_chatterbox(self, text, lang):
+        """Chatterbox Multilingual via mlx-audio. Returns (audio, sr, dur) or
+        None on failure (caller falls back to Kokoro). Runs on the worker
+        thread — MLX models are thread-affine, same rule as stt.py."""
+        try:
+            import numpy as np
+
+            if self._cb is None:
+                from mlx_audio.tts.utils import load as _load_tts
+
+                print(f"[tts] loading chatterbox ({self.chatterbox_model}, "
+                      "first non-English line pays this once)…", flush=True)
+                self._cb = _load_tts(self.chatterbox_model)
+                if self.voice_ref:
+                    ref = os.path.expanduser(self.voice_ref)
+                    try:
+                        # 24000 = chatterbox's S3GEN_SR; string refs are loaded
+                        # (and resampled) at that rate by prepare_conditionals.
+                        self._cb_conds = self._cb.prepare_conditionals(
+                            ref, 24000, self.exaggeration)
+                        print(f"[tts] cloned voice from {ref}", flush=True)
+                    except Exception as exc:
+                        print(f"[tts] voice_ref failed ({exc}); "
+                              "using built-in voice", flush=True)
+                        self._cb_conds = None
+            code = (lang or _guess_lang(text)).split("-")[0].lower()
+            code = {"cmn": "zh"}.get(code, code)
+            chunks, sr = [], 24000
+            for r in self._cb.generate(
+                    text, lang_code=code, conds=self._cb_conds,
+                    exaggeration=self.exaggeration, verbose=False):
+                chunks.append(np.asarray(r.audio, dtype=np.float32).reshape(-1))
+                sr = int(r.sample_rate)
+            audio = np.concatenate(chunks) if chunks else None
+            if audio is None or audio.size == 0:
+                raise RuntimeError("no audio produced")
+            self._cb_fails = 0
+            return audio, sr, len(audio) / float(sr)
+        except Exception as exc:
+            self._cb_fails += 1
+            print(f"[tts] chatterbox failed ({type(exc).__name__}: {exc}); "
+                  "using kokoro", flush=True)
+            if self._cb_fails >= 2:
+                print("[tts] disabling chatterbox for this session", flush=True)
+            return None
+
+    # ------------------------------------------------------ kokoro (ONNX, CPU)
+
+    def _synth_kokoro(self, text, voice, speed, lang):
         try:
             import numpy as np
             from kokoro_onnx import Kokoro
@@ -182,7 +331,9 @@ class Speaker:
 
         voice = voice or self.voice
         speed = self.speed if speed is None else speed
-        lang = lang or _lang_for_voice(voice)
+        # A chatterbox-style code ("sv") can land here via the fallback path —
+        # kokoro only knows its own tags, so anything else derives from voice.
+        lang = lang if lang in _KOKORO_LANGS else _lang_for_voice(voice)
         try:
             if self._model is None:
                 onnx_path, voices_path = _ensure_models()
@@ -211,21 +362,26 @@ class Speaker:
                   flush=True)
             return None
 
-    def speak(self, text, voice=None, speed=None, blocking=True):
+    def speak(self, text, voice=None, speed=None, blocking=True, lang=None):
         """Synthesize and play (pitch applied). Uses the prerender cache for
-        default-voice lines so there's no synth delay at call time. Returns the
-        raw (audio, sr, duration) tuple or None."""
-        default = voice is None and speed is None
+        default-voice lines so there's no synth delay at call time. `lang`
+        forces the language route (the Marvin's-language menu passes it for
+        answers; quips never do). Returns (audio, sr, duration) or None."""
+        default = voice is None and speed is None and lang is None
         if default and text in self._cache:
             audio, sr = self._cache[text]
             out = (audio, sr, len(audio) / float(sr))
         else:
-            out = self.synth(text, voice=voice, speed=speed)
+            chunks = _split_sentences(text)
+            if len(chunks) > 1:
+                return self._speak_streaming(chunks, voice, speed, lang)
+            out = self.synth(text, voice=voice, speed=speed, lang=lang)
             if out is None:
                 return None
             if default:  # cache default-voice renders for instant replay
                 self._cache[text] = (out[0], out[1])
         audio, sr, _ = out
+        self._interrupted.clear()
         self._playing = True
         try:
             self._play(audio, sr)
@@ -235,6 +391,59 @@ class Speaker:
         finally:
             self._playing = False
         return out
+
+    def interrupt(self):
+        """Cut playback off mid-sentence (barge-in).
+
+        Kills the running afplay and stops the streaming loop from starting the
+        next sentence. Safe to call from any thread and when nothing is playing.
+        """
+        self._interrupted.set()
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _speak_streaming(self, chunks, voice, speed, lang):
+        """Play a multi-sentence line as it renders, instead of after.
+
+        Time-to-first-word is what a spoken answer is judged on, and rendering
+        the whole thing first wasted ~1s of silence on a typical reply. Synthesis
+        runs on the Speaker's single worker thread while playback blocks in
+        afplay (a separate process), so every chunk after the first renders
+        during the previous one's playback — Kokoro synthesizes at ~0.45x
+        realtime, comfortably ahead of the speaker.
+        """
+        pool = self._executor()
+        pending = [pool.submit(self._run_synth, c, voice, speed, lang)
+                   for c in chunks]
+        first = last = None
+        self._interrupted.clear()
+        self._playing = True
+        try:
+            for fut in pending:
+                if self._interrupted.is_set():
+                    break
+                try:
+                    out = fut.result()
+                except Exception as exc:
+                    print(f"[tts] chunk synth failed: {exc!r}", flush=True)
+                    continue
+                if out is None:
+                    continue
+                first = first or out
+                last = out
+                try:
+                    self._play(out[0], out[1])
+                except Exception as exc:
+                    print(f"[tts] playback failed "
+                          f"({type(exc).__name__}: {exc})", flush=True)
+                    break
+        finally:
+            self._playing = False
+        return first or last
 
     def _play(self, audio, sr):
         """Play a rendered waveform, blocking until it finishes.
@@ -254,19 +463,53 @@ class Speaker:
 
         if sys.platform == "darwin":
             path = os.path.join(
-                tempfile.gettempdir(), f"whisperflow-tts-{os.getpid()}.wav"
+                tempfile.gettempdir(), f"whisperflow-tts-{os.getpid()}-"
+                f"{threading.get_ident()}.wav"
             )
             write_wav(path, audio, int(sr * self.pitch))
-            subprocess.run(
+            if self._interrupted.is_set():
+                return
+            # Popen (not run) so barge-in can cut him off mid-sentence.
+            proc = subprocess.Popen(
                 ["afplay", path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                check=False,
             )
+            self._proc = proc
+            try:
+                proc.wait()
+            finally:
+                self._proc = None
+                try:
+                    os.unlink(path)  # one file per speak thread — don't litter
+                except OSError:
+                    pass
         else:  # non-mac fallback (no recorder conflict there in practice)
             import sounddevice as sd
 
             sd.play(audio, int(sr * self.pitch))
             sd.wait()
+
+
+def _split_sentences(text, min_chars=25):
+    """Split a spoken line into sentence-sized chunks for streaming playback.
+
+    Very short fragments are merged forward: synthesizing "Oslo." alone costs
+    almost as much as a full sentence, and chopping too finely makes the
+    delivery choppy without buying any latency.
+    """
+    import re
+
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", (text or "").strip())]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return parts
+    merged = []
+    for p in parts:
+        if merged and len(merged[-1]) < min_chars:
+            merged[-1] = f"{merged[-1]} {p}"
+        else:
+            merged.append(p)
+    return merged
 
 
 def write_wav(path, audio, sample_rate):
@@ -291,12 +534,20 @@ def _main(argv=None):
     p.add_argument("text", nargs="?",
                    default="Hello, I am Marvin. I think you will be underwhelmed.",
                    help="text to speak")
-    p.add_argument("--voice", default=_DEFAULT_VOICE, help="Kokoro voice preset")
-    p.add_argument("--speed", type=float, default=1.0, help="speech rate")
+    p.add_argument("--voice", default=None,
+                   help="Kokoro voice preset (forces the kokoro engine)")
+    p.add_argument("--engine", choices=("auto", "kokoro", "chatterbox"),
+                   default="auto",
+                   help="auto = English->kokoro, other languages->chatterbox")
+    p.add_argument("--ref", metavar="REF.wav", default=None,
+                   help="reference audio to clone (chatterbox voice cloning)")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="speech rate (kokoro only)")
     p.add_argument("--pitch", type=float, default=_DEFAULT_PITCH,
                    help="pitch multiplier (1.0 = natural, 1.35 = cartoon default)")
     p.add_argument("--lang", default=None,
-                   help="lang override (default derived from voice prefix)")
+                   help="lang override: kokoro tag (en-gb) or chatterbox "
+                        "code (sv); default auto-guessed from the text")
     p.add_argument("--save", metavar="OUT.wav",
                    help="write a WAV instead of playing (headless verify)")
     p.add_argument("--list-voices", action="store_true",
@@ -321,7 +572,8 @@ def _main(argv=None):
             print(f"  - {q}")
         return 0
 
-    sp = Speaker(voice=args.voice, speed=args.speed, pitch=args.pitch)
+    sp = Speaker(speed=args.speed, pitch=args.pitch, engine=args.engine,
+                 voice_ref=args.ref)
 
     if args.quips or args.quip:
         picks = _QUIPS if args.quips else [random.choice(_QUIPS)]
@@ -330,7 +582,7 @@ def _main(argv=None):
             sp.speak(q)
         return 0
     if args.save:
-        out = sp.synth(args.text, lang=args.lang)
+        out = sp.synth(args.text, voice=args.voice, lang=args.lang)
         if out is None:
             print("[tts] no audio produced", flush=True)
             return 1
@@ -342,9 +594,9 @@ def _main(argv=None):
               flush=True)
         return 0
 
-    print(f"[tts] speaking as {args.voice} (pitch {args.pitch}): {args.text!r}",
-          flush=True)
-    out = sp.speak(args.text, voice=args.voice, speed=args.speed)
+    print(f"[tts] speaking ({args.engine}, voice {args.voice or 'default'}, "
+          f"pitch {args.pitch}): {args.text!r}", flush=True)
+    out = sp.speak(args.text, voice=args.voice)
     if out is None:
         print("[tts] failed — see messages above", flush=True)
         return 1

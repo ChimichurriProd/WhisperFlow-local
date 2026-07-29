@@ -9,6 +9,8 @@ Two engines:
   because it can't use the GPU.
 
 Both bias toward custom-vocabulary terms via initial_prompt.
+
+Swedish gets a specialist: see SWEDISH_MODELS and Transcriber.swedish_model.
 """
 
 import concurrent.futures
@@ -19,7 +21,16 @@ _MLX_REPOS = {
     "small": "mlx-community/whisper-small-mlx",
     "medium": "mlx-community/whisper-medium-mlx",
     "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    # KB-Whisper (KBLab, fine-tuned on 50 000 h of Swedish): roughly a third
+    # fewer Swedish errors than whisper-large-v3, and even the small one beats
+    # it. Swedish-only — reached via swedish_model, never via the Model menu.
+    # Community MLX conversions (no official mlx-community build exists).
+    "kb-small": "Leonidng/kb-whisper-small-mlx",
+    "kb-large": "jegeblad/kb-whisper-large-mlx-q8",
 }
+
+# Values accepted by stt.swedish_model ("Swedish accuracy" menu).
+SWEDISH_MODELS = ("kb-small", "kb-large")
 
 
 def build_initial_prompt(terms):
@@ -39,7 +50,7 @@ class Transcriber:
 
     def __init__(self, model="large-v3-turbo", engine="mlx", language=None,
                  vad_filter=True, device="cpu", compute_type="int8",
-                 initial_prompt=None):
+                 initial_prompt=None, swedish_model=None):
         self.model_name = model
         self.engine = engine
         self.language = language or None  # None/"" -> auto-detect per utterance
@@ -47,12 +58,38 @@ class Transcriber:
         self.device = device
         self.compute_type = compute_type
         self.initial_prompt = initial_prompt
+        # KB-Whisper name (see SWEDISH_MODELS) to handle Swedish with, or None
+        # for "one model for every language". MLX engine only.
+        self.swedish_model = swedish_model or None
         self._fw_model = None  # faster-whisper instance (lazy)
         self._mlx_pool = None  # single-thread executor for MLX (lazy)
         self._mlx_fails = 0    # consecutive MLX failures -> auto-disable
+        self._sv_fails = 0     # consecutive Swedish-model failures -> give up
         self.last_language = None  # language of the most recent transcription
                                    # (forced language, else what STT detected) —
                                    # lets the ask flow skip TTS for non-English.
+        self.last_model = None     # model name that produced last_language's text
+                                   # (a kb-* name when Swedish routing kicked in)
+
+    def warm(self):
+        """Preload the MLX model(s) by pushing half a second of silence through
+        each, so the first real dictation doesn't pay the model-load cost.
+        Blocks until loaded — run it on a background thread (see
+        PushToTalkApp.prewarm). mlx-whisper caches models process-wide, so the
+        warmth survives _rebuild_transcriber (model/language switches).
+        """
+        if self.engine != "mlx":
+            return  # faster-whisper is the rarely-used CPU fallback; skip
+        import numpy as np
+
+        silence = np.zeros(8000, dtype=np.float32)
+        pool = self._ensure_pool()
+        # Forced language: skips detection, and keeps warm-up out of the log.
+        pool.submit(self._run_mlx, silence, self.model_name,
+                    self.language or "en").result()
+        if self.swedish_model:
+            pool.submit(self._run_mlx, silence, self.swedish_model,
+                        "sv").result()
 
     def transcribe(self, audio):
         """audio: 1-D float32 at 16 kHz. Returns the joined transcript string."""
@@ -79,7 +116,7 @@ class Transcriber:
 
     # ------------------------------------------------------------- mlx (GPU)
 
-    def _transcribe_mlx(self, audio):
+    def _ensure_pool(self):
         # MLX arrays and GPU streams are thread-affine: a model cached on the
         # thread that first loaded it cannot be evaluated from another thread
         # ("There is no Stream(gpu, N) in current thread"). on_release spawns a
@@ -89,21 +126,65 @@ class Transcriber:
             self._mlx_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="mlx-stt"
             )
-        return self._mlx_pool.submit(self._run_mlx, audio).result()
+        return self._mlx_pool
 
-    def _run_mlx(self, audio):
+    def _transcribe_mlx(self, audio):
+        pool = self._ensure_pool()
+        run = lambda model, lang=None: pool.submit(  # noqa: E731
+            self._run_mlx, audio, model, lang
+        ).result()
+
+        # Swedish routing. The language is either known up front (the user
+        # forced Svenska -> straight to the specialist, one pass) or not (auto
+        # -detect -> the general model transcribes AND detects, and a Swedish
+        # verdict earns a second pass on KB-Whisper). Only Swedish utterances
+        # pay for the second decode; everything else is unchanged.
+        if self._use_swedish_model():
+            if self.language == "sv":
+                return run(self.swedish_model, "sv")
+            text = run(self.model_name)
+            if text and self.last_language == "sv":
+                try:
+                    return run(self.swedish_model, "sv")
+                except Exception as exc:
+                    # A broken/missing Swedish model must never lose the
+                    # transcript we already have — keep the general one.
+                    self._sv_fails += 1
+                    print(f"[stt] {self.swedish_model} failed "
+                          f"({type(exc).__name__}: {exc}); keeping "
+                          f"{self.model_name}", flush=True)
+                    if self._sv_fails >= 2:
+                        print("[stt] disabling the Swedish model for this "
+                              "session", flush=True)
+                        self.swedish_model = None
+            return text
+        return run(self.model_name)
+
+    def _use_swedish_model(self):
+        """Swedish routing is on when a KB-Whisper model is configured and the
+        language could still be Swedish (a forced en/es never reroutes)."""
+        return bool(self.swedish_model) and self.language in (None, "sv")
+
+    def _run_mlx(self, audio, model_name, language=None):
         import mlx_whisper  # lazy: pulls in MLX
 
-        repo = _MLX_REPOS.get(self.model_name, _MLX_REPOS["large-v3-turbo"])
-        opts = {"path_or_hf_repo": repo}
+        repo = _MLX_REPOS.get(model_name, _MLX_REPOS["large-v3-turbo"])
+        language = language or self.language
+        # Dictation utterances are independent — never seed a window with the
+        # previous window's text. Conditioning lets a repetition loop in one
+        # 30s window poison every following window (Whisper keeps the last
+        # decode even when all temperature fallbacks fail its quality checks;
+        # cleanup.collapse_repeats is the net for loops within a window).
+        opts = {"path_or_hf_repo": repo, "condition_on_previous_text": False}
         if self.initial_prompt:
             opts["initial_prompt"] = self.initial_prompt
-        if self.language:
-            opts["language"] = self.language
+        if language:
+            opts["language"] = language
         result = mlx_whisper.transcribe(audio, **opts)
         text = (result.get("text") or "").strip()
-        self.last_language = self.language or result.get("language")
-        if self.language is None and text:
+        self.last_language = language or result.get("language")
+        self.last_model = model_name
+        if language is None and text:
             print(f"[stt] detected language: {result.get('language')}", flush=True)
         return text
 
@@ -128,6 +209,7 @@ class Transcriber:
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         self.last_language = self.language or info.language
+        self.last_model = self.model_name  # CPU path has no Swedish specialist
         if self.language is None and text:
             print(f"[stt] detected language: {info.language} "
                   f"(p={info.language_probability:.2f})", flush=True)

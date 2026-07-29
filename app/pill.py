@@ -169,6 +169,17 @@ try:
     def _model_style(model):
         return _MODEL_STYLE.get(model, ((0.60, 0.80, 1.0), 4.5))
 
+    def _live_style(c):
+        """The model dot/orb's colour+size right now: the model's own colour,
+        or an unlit grey breathing pulse while the STT models are still
+        loading — the visible answer to "is it broken, or just loading?".
+        set_warming(False) pops the orb (the model-switch flare) as "ready"."""
+        color, radius = _model_style(c.model)
+        if getattr(c, "warming", False):
+            color = (0.62, 0.64, 0.70)
+            radius *= 0.70 + 0.30 * math.sin(c._anim * 3.0)
+        return color, radius
+
     def _measure(text, size=11):
         """Rendered width of *text* in the pill's font (for dynamic sizing)."""
         attrs = NSMutableDictionary.dictionary()
@@ -390,7 +401,7 @@ try:
             path.stroke()
 
             if c.mode == "idle":
-                color, radius = _model_style(c.model)
+                color, radius = _live_style(c)
                 if c.hover:
                     self._glow_dot(18, h / 2.0, radius, color)
                     self._text(_hover_label(c.model), 34, h, size=11)
@@ -525,7 +536,7 @@ try:
             the post-swallow digest glow."""
             if c._turn_f > 0.5:
                 return  # the oracle owns the stage while he's turned around
-            color, radius = _model_style(c.model)
+            color, radius = _live_style(c)
             ev = c._orb_event
             if ev is not None and ev[0] == "digest":
                 if not behind:
@@ -831,6 +842,7 @@ try:
             self.style = style
             self.mode = "idle"
             self.model = "small"
+            self.warming = False  # STT models still loading (grey orb pulse)
             self.hover = False
             self.skin = skin
             self.center = None
@@ -978,6 +990,17 @@ try:
             self.model = model
             if changed and self.style == "marvin":
                 self._orb_pop = 1.0      # firefly flare acknowledging the switch
+            self._render()
+
+        def set_warming(self, on):
+            """Grey out the model orb while the STT models load (see
+            _live_style); flare it when they're ready. Main thread only."""
+            on = bool(on)
+            if on == getattr(self, "warming", False):
+                return
+            self.warming = on
+            if not on and self.style == "marvin":
+                self._orb_pop = 1.0      # lights on: same flare as a switch
             self._render()
 
         def set_hover(self, value):

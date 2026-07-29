@@ -17,6 +17,27 @@ faster-whisper>=1.0.0
 # The ~330MB model files auto-download once to ~/.cache/kokoro-onnx/ on first use.
 kokoro-onnx>=0.4.7
 
+# TTS: Chatterbox Multilingual via mlx-audio (Apple-Silicon GPU) — Swedish +
+# 22 other languages and zero-shot voice cloning (tts section in config.json).
+# The ~1.4GB weights auto-download to the HF cache on first non-English line.
+# transformers is pinned <5.13: mlx-lm 0.31.x passes a string key to
+# AutoTokenizer.register, which transformers 5.13 rejects with
+# "'str' object has no attribute '__module__'" (ml-explore/mlx-lm#1461).
+mlx-audio>=0.4.4; platform_machine == "arm64" and sys_platform == "darwin"
+transformers>=5.7,<5.13; platform_machine == "arm64" and sys_platform == "darwin"
+
+# Wake word: hands-free "Hey Marvin" (wakeword section in config.json, opt-in).
+# INFERENCE ONLY — this is the base package, which is just numpy + onnxruntime
+# and a ~1MB classifier. Do NOT add the [train] extra here: training pulls
+# torch/torchaudio/librosa and ~7GB of datasets and belongs in the throwaway
+# venv that scripts/train_wakeword.sh builds, not in the app.
+livekit-wakeword>=0.2.1
+# onnxruntime 1.27.x mis-executes the wake word's speech-embedding model: the
+# mel and the classifier are correct, but the embeddings come out wrong, so
+# every score collapses to ~0.002 and detection NEVER fires — silently. 1.28.0
+# is correct. app/wakeword.py refuses to start on anything older.
+onnxruntime>=1.28
+
 # macOS system integration: global hotkey listener + keystroke synthesis.
 # Clipboard uses the built-in pbcopy/pbpaste, no extra dependency.
 pynput>=1.7.6

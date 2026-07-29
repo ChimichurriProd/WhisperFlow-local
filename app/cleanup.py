@@ -39,6 +39,61 @@ CLEANUP_PROMPT = (
 )
 
 
+_TOKEN_STRIP = ",.!?;:\"'()…"
+
+# Fused repetition loops: Whisper can weld a repeat loop into ONE token with no
+# spaces ("useertasertasertas…" — seen injected into a real document), which
+# the token-level collapse below can never catch. A non-space unit of 3-12
+# chars repeated 4+ times back-to-back is noise, not language (even Swedish
+# compounds like "barnbarnsbarn" only reach 3 in a row).
+_FUSED_REPEAT_RE = re.compile(r"([^\s]{3,12}?)\1{3,}")
+
+
+def collapse_repeats(text):
+    """Whisper hallucination guard (seen in the wild: "myślę, " repeated 94
+    times on a short Swedish utterance misdetected as English). Whisper keeps
+    its final decode even when every temperature fallback fails the quality
+    checks, so loops must be caught here, after STT:
+
+    - an utterance of >=5 tokens that are all the SAME token -> "" (drop it)
+    - a 2-3-token phrase repeated >=3 times in a row -> one occurrence
+    - a single token repeated >=4 times in a row -> one occurrence
+      (>=4 so dictated "nej, nej, nej" survives)
+    - text with no letters or digits at all (a lone "!") -> ""
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = _FUSED_REPEAT_RE.sub(r"\1", text)  # in-token loops first
+    tokens = text.split()
+    norm = [t.strip(_TOKEN_STRIP).lower() for t in tokens]
+    if len(tokens) >= 5 and len(set(norm)) == 1:
+        return ""
+    out, i = [], 0
+    while i < len(tokens):
+        collapsed = False
+        for unit in (3, 2, 1):
+            min_reps = 4 if unit == 1 else 3
+            if i + unit * min_reps > len(tokens):
+                continue
+            reps = 1
+            while norm[i:i + unit] == norm[i + reps * unit:
+                                           i + (reps + 1) * unit]:
+                reps += 1
+            if reps >= min_reps:
+                out.extend(tokens[i:i + unit])
+                i += reps * unit
+                collapsed = True
+                break
+        if not collapsed:
+            out.append(tokens[i])
+            i += 1
+    result = " ".join(out)
+    if not re.search(r"[^\W_]", result):  # no letters/digits left -> noise
+        return ""
+    return result
+
+
 def apply_vocabulary_fixes(text, fixes):
     """Force exact corrections (wrong -> right), whole-word, case-insensitive.
 
@@ -83,7 +138,10 @@ def ollama_clean(text, ollama_url, ollama_model, timeout=30, keep_alive="30m"):
 
 def clean_transcript(text, config):
     """Full cleanup pipeline honoring the <N-word LLM skip and Ollama fallback."""
-    text = text.strip()
+    # STT-artifact guard first — runs even in verbatim mode (a hallucination
+    # loop is not "what was said") and before the word count, so 94 junk
+    # tokens never route the utterance to the LLM.
+    text = collapse_repeats(text)
     if not text:
         return ""
 

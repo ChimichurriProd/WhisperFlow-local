@@ -3,6 +3,7 @@
     "engine": "mlx",
     "model": "large-v3-turbo",
     "language": null,
+    "swedish_model": "kb-large",
     "vad_filter": true,
     "device": "cpu",
     "compute_type": "int8"
@@ -10,7 +11,7 @@
   "cleanup": {
     "enabled": true,
     "ollama_url": "http://localhost:11434",
-    "ollama_model": "llama3.1:8b",
+    "ollama_model": "gemma4:12b",
     "skip_llm_under_words": 10,
     "timeout_seconds": 30,
     "keep_alive": "30m"
@@ -24,7 +25,10 @@
     "enabled": true,
     "voice": true,
     "timeout_seconds": 60,
-    "temperature": 0.5
+    "temperature": 0.5,
+    "num_predict": 140,
+    "conversation_turns": 3,
+    "conversation_idle_seconds": 180
   },
   "injection": {
     "delivery_method": "clipboard",
@@ -38,7 +42,12 @@
     "mic_gain": 4.5
   },
   "vocabulary": {
-    "terms": ["Ollama", "WhisperFlow", "faster-whisper", "CTranslate2"],
+    "terms": [
+      "Ollama",
+      "WhisperFlow",
+      "faster-whisper",
+      "CTranslate2"
+    ],
     "fixes": {}
   },
   "sound_cues": {
@@ -46,7 +55,25 @@
     "start": "Tink",
     "done": "Pop"
   },
+  "tts": {
+    "engine": "auto",
+    "language": "en",
+    "chatterbox_model": "theoracleguy/Chatterbox-Multilingual-MLX-v2-fp16",
+    "voice_ref": "/Users/skonheten/Documents/WISPER_FLOW/assets/marvin/voice_ref.wav",
+    "exaggeration": 0.3,
+    "pitch": 1.35
+  },
   "ui": {
     "pill_style": "marvin"
+  },
+  "wakeword": {
+    "enabled": false,
+    "phrase": "Hey Marvin",
+    "threshold": 0.7,
+    "debug": false,
+    "silence_seconds": 0.9,
+    "dump_seconds": 0,
+    "silence_rms": 0.004,
+    "start_timeout_seconds": 4.0
   }
 }

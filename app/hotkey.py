@@ -16,7 +16,7 @@ import threading
 import time
 
 from .audio import Recorder
-from .cleanup import clean_transcript
+from .cleanup import clean_transcript, collapse_repeats
 from .injection import inject_text
 from .sound import play_done, play_start
 from .stt import Transcriber, build_initial_prompt
@@ -181,11 +181,205 @@ class PushToTalkApp:
         self._ask_vk = None
         self._ask_on = config.get("ask", {}).get("enabled", True)
         self._paused = False
+        # Hands-free: this recording was opened by the wake word, so no key will
+        # ever be released to end it (see _wake_endpoint).
+        self._hands_free = False
+        self.wake = None  # WakeWord detector, built by start_wakeword()
+        # Barge-in state: who is speaking, so the wake word can cut him off.
+        self._speaking = False
+        self._speaker = None
+        # Rolling conversation so follow-ups make sense ("and Denmark?").
+        # Cleared after conversation_idle_seconds — an hour-old thread is not
+        # context, it's confusion.
+        self._turns = []
+        self._last_turn = 0.0
         self._set_hotkey_params(config["hotkey"]["push_to_talk"])
         self._set_ask_hotkey_params(
             config.get("hotkey", {}).get("ask", "control + shift + a")
         )
+        # Prewarm state: True while the lazy models are still loading in the
+        # background. The UI reads it for the "loading, not crashed" cue.
+        self.warming = False
+        self._warm_thread = None
         threading.Thread(target=self._watchdog, daemon=True).start()
+
+    def prewarm(self):
+        """Load every lazy model in the background so the FIRST dictation and
+        the FIRST answer are as fast as every later one: both Whisper models
+        (through the same single MLX worker real dictations use, so a dictation
+        started mid-warm simply queues behind the load instead of failing) and
+        the Ollama answer model. While this runs, self.warming is True and the
+        pill greys out Marvin's model orb — the visible difference between
+        "still loading" and "crashed"."""
+        if self._warm_thread is not None and self._warm_thread.is_alive():
+            return self._warm_thread
+
+        def _run():
+            self.warming = True
+            t0 = time.monotonic()
+            try:
+                try:
+                    self.transcriber.warm()
+                except Exception as exc:
+                    print(f"[warm] stt warm failed: {exc!r}", flush=True)
+                try:
+                    from . import ollama
+
+                    cfg = self.config.get("cleanup", {})
+                    ollama.warm(
+                        cfg.get("ollama_url", "http://localhost:11434"),
+                        cfg.get("ollama_model", "gemma4:12b"),
+                        keep_alive=cfg.get("keep_alive", "30m"),
+                    )
+                except Exception:
+                    pass  # ollama down: the ask path already degrades politely
+            finally:
+                self.warming = False
+                print(f"[warm] models ready ({time.monotonic() - t0:.1f}s)",
+                      flush=True)
+
+        self._warm_thread = threading.Thread(
+            target=_run, daemon=True, name="prewarm"
+        )
+        self._warm_thread.start()
+        return self._warm_thread
+
+    # ------------------------------------------------------------- wake word
+
+    def start_wakeword(self):
+        """Build and start the "Hey Marvin" detector if it's switched on. Safe
+        to call repeatedly; returns the detector or None."""
+        self.stop_wakeword()
+        cfg = self.config.get("wakeword", {})
+        if not cfg.get("enabled", False):
+            return None
+        from .wakeword import WakeWord, default_model_path
+
+        path = cfg.get("model") or default_model_path()
+        if not path:
+            print("[wake] no wake-word model installed — see "
+                  "scripts/train_wakeword.sh", flush=True)
+            return None
+        self.wake = WakeWord(
+            path, on_detect=self._on_wake,
+            threshold=cfg.get("threshold", 0.5),
+            debounce=cfg.get("debounce", 2.0),
+            sample_rate=self.config["audio"]["sample_rate"],
+            debug=cfg.get("debug", False),
+            dump_seconds=cfg.get("dump_seconds", 0),
+        )
+        # Share the mic stream the recorder already holds open rather than
+        # opening a second one (audio.py explains why that matters).
+        self.wake.overflow_source = lambda: self.recorder.overflows
+        self.recorder.on_frame = self.wake.feed
+        self.recorder._ensure_stream()
+        self.wake.start()
+        return self.wake
+
+    def stop_wakeword(self):
+        self.recorder.on_frame = None
+        if self.wake is not None:
+            self.wake.stop()
+            self.wake = None
+
+    def set_wakeword_enabled(self, enabled):
+        self.config.setdefault("wakeword", {})["enabled"] = bool(enabled)
+        if enabled:
+            return self.start_wakeword()
+        self.stop_wakeword()
+        return None
+
+    def set_wake_suppressed(self, suppressed):
+        """Go deaf while Marvin is recording — his own voice saying his own
+        name would otherwise start a fresh question."""
+        if self.wake is not None:
+            self.wake.set_suppressed(suppressed)
+            if not suppressed:
+                self.wake.hush()  # ignore the tail of his own sentence
+
+    def set_speaking(self, speaking, speaker):
+        """Marvin started/finished talking. Unlike recording, he stays LISTENING
+        while he speaks, so "Hey Marvin" can barge in and cut him off."""
+        self._speaker = speaker if speaking else None
+        self._speaking = bool(speaking)
+        if self.wake is None:
+            return
+        if speaking:
+            # Listen through his own voice. He never says the wake phrase, and
+            # the model scores continuous unrelated speech near zero. BUT a
+            # recording in flight keeps its suppression — a quip racing a
+            # dictation start must not reopen the wake word mid-question.
+            if not self._active:
+                self.wake.set_suppressed(False)
+        else:
+            self.wake.hush()  # don't let the tail of his sentence retrigger
+
+    def _on_wake(self, score):
+        """Wake phrase heard: open an ask episode with no key held."""
+        if self._paused:
+            return
+        # Barge-in: if he's mid-answer, cut him off and take the new question.
+        # This has to happen before the _busy check — during playback the ask
+        # pipeline may still hold that lock.
+        if self._speaking and self._speaker is not None:
+            print("[wake] interrupted mid-answer", flush=True)
+            try:
+                self._speaker.interrupt()
+            except Exception as exc:
+                print(f"[wake] interrupt failed: {exc!r}", flush=True)
+            self._speaking = False
+            # Give playback a moment to die so its tail isn't recorded.
+            time.sleep(0.15)
+        if self._active or self._busy.locked():
+            return
+        if not self._ask_on:
+            print("[wake] heard, but Ask Marvin is switched off", flush=True)
+            return
+        self._start_recording("ask", hands_free=True)
+        threading.Thread(target=self._wake_endpoint, daemon=True).start()
+
+    def _wake_endpoint(self):
+        """End a hands-free recording when the user stops talking. No key is
+        held, so this is the only thing that can close it (bar the 120s cap).
+
+        The silence countdown starts when SPEECH does, not when the recording
+        does. Running it from the start meant a user who took a beat to think
+        after the beep was cut off before saying anything — recordings came
+        back 1.0s long and empty, and Whisper hallucinated on the silence.
+        """
+        cfg = self.config.get("wakeword", {})
+        silence = float(cfg.get("silence_seconds", 0.9))
+        max_s = float(cfg.get("max_seconds", 15.0))
+        wait_s = float(cfg.get("start_timeout_seconds", 4.0))
+        # silence_rms is a FLOOR, not the whole story: the live threshold sits
+        # above the measured room noise, so a quiet mic still registers speech.
+        floor = float(cfg.get("silence_rms", 0.004))
+        ambient = getattr(self.wake, "ambient", 0.0) if self.wake else 0.0
+        # Adaptive, but capped: in a NOISY room 3x ambient could climb above
+        # speech itself, and then the endpoint would never see the user start
+        # talking — the same "cut off before a word was said" bug from the
+        # other direction. 0.02 sits well under measured speech on this mic.
+        threshold = max(floor, min(ambient * 3.0, 0.02))
+        start = last_voice = time.monotonic()
+        speaking = False
+        while self._active and self._hands_free:
+            time.sleep(0.05)
+            now = time.monotonic()
+            if self.wake is not None and self.wake.rms > threshold:
+                last_voice = now
+                speaking = True
+            if not speaking:
+                # Still waiting for them to begin. Only give up if they never do.
+                if now - start > wait_s:
+                    self._stop_recording("wake: nothing said")
+                    return
+                continue
+            if now - last_voice > silence:
+                self._stop_recording("wake: silence")
+                return
+            if now - start > max_s:
+                self._stop_recording("wake: max duration")
+                return
 
     def set_paused(self, paused):
         """Pause/resume dictation without touching the listener (restarting the
@@ -276,20 +470,29 @@ class PushToTalkApp:
         if self._on_status is not None:
             self._on_status(state)
 
-    def _start_recording(self, kind="dictate"):
+    def _start_recording(self, kind="dictate", hands_free=False):
         with self._state_lock:
             if self._active or self._paused:
                 return
             self._active = True
             self._active_kind = kind
+            self._hands_free = hands_free
             # Tell the watchdog which key to poll for release (dictate vs ask).
-            if kind == "ask":
+            # A hands-free take has no key at all: leaving both as None keeps
+            # the watchdog's "was it released?" check from instantly killing it.
+            if hands_free:
+                self._active_trigger_vk = None
+                self._active_rmod_flag = None
+            elif kind == "ask":
                 self._active_trigger_vk = self._ask_vk
                 self._active_rmod_flag = None
             else:
                 self._active_trigger_vk = self._trigger_vk
                 self._active_rmod_flag = self._rmod_flag
             self._rec_start = time.monotonic()
+        # Don't let the mic hear him while he's listening to a question.
+        if self.wake is not None:
+            self.wake.set_suppressed(True)
         if kind == "ask":
             # Signal the UI that an ask episode has begun (Marvin turns around).
             if self._on_ask_start is not None:
@@ -371,6 +574,13 @@ class PushToTalkApp:
         self.config["stt"]["language"] = language
         self._rebuild_transcriber()
 
+    def set_swedish_model(self, name):
+        """Choose the KB-Whisper model Swedish is transcribed with (None = use
+        the general model for every language). Loads lazily on first Swedish
+        utterance, so switching here costs nothing until then."""
+        self.config["stt"]["swedish_model"] = name
+        self._rebuild_transcriber()
+
     def _wait_hotkey_released(self, timeout=1.0):
         """Block until the user lets go of the hotkey keys (or timeout).
 
@@ -390,6 +600,7 @@ class PushToTalkApp:
             # A previous transcription is still finishing; ignore this press
             # (don't leave _active set, or the watchdog would spin on it).
             self._active = False
+            self.set_wake_suppressed(False)  # on_release won't run to undo it
             return
         print("[rec] listening...", flush=True)
         self._status("recording")
@@ -401,6 +612,7 @@ class PushToTalkApp:
             # letting the exception break the listener callback.
             print(f"[rec] could not start mic: {exc}", flush=True)
             self._active = False
+            self.set_wake_suppressed(False)
             self._status("idle")
 
     def on_release(self, kind="dictate"):
@@ -426,7 +638,14 @@ class PushToTalkApp:
                     print("[stt] (nothing recognized)", flush=True)
                     return
                 if kind == "ask":
-                    self._handle_ask(raw)
+                    # Same hallucination guard as dictation: don't send a
+                    # Whisper repetition loop to the LLM as a "question".
+                    question = collapse_repeats(raw)
+                    if not question:
+                        print("[stt] (hallucination filtered, ask dropped)",
+                              flush=True)
+                        return
+                    self._handle_ask(question)
                     return
                 cleaned = clean_transcript(raw, self.config)
                 if not cleaned:
@@ -440,6 +659,10 @@ class PushToTalkApp:
                 inject_text(to_inject, self.config)
                 play_done(self.config)
             finally:
+                self._hands_free = False
+                # Listen again — after a beat, so the tail of the user's own
+                # question can't be heard as a fresh "Hey Marvin".
+                self.set_wake_suppressed(False)
                 self._status("idle")
 
     def _warm_ask_model(self):
@@ -451,8 +674,36 @@ class PushToTalkApp:
         url = ask.get("ollama_url") or clean.get("ollama_url",
                                                  "http://localhost:11434")
         model = ask.get("ollama_model") or clean.get("ollama_model",
-                                                      "llama3.1:8b")
+                                                      "gemma4:12b")
         ollama.warm(url, model, keep_alive=clean.get("keep_alive", "30m"))
+
+    def _conversation_history(self):
+        """Prior turns to send with the next question, oldest first.
+
+        Expires after ask.conversation_idle_seconds: reviving an hour-old
+        thread isn't context, it's confusion — and every retained turn is
+        tokens gemma4 has to re-read before it can start answering.
+        """
+        ask = self.config.get("ask", {})
+        idle = float(ask.get("conversation_idle_seconds", 180))
+        if not self._turns or time.monotonic() - self._last_turn > idle:
+            self._turns = []
+            return []
+        keep = int(ask.get("conversation_turns", 3)) * 2
+        return self._turns[-keep:] if keep > 0 else []
+
+    def _remember_turn(self, question, answer):
+        self._turns.extend(
+            [("user", question), ("assistant", answer)]
+        )
+        keep = int(self.config.get("ask", {}).get("conversation_turns", 3)) * 2
+        del self._turns[:-keep or None]
+        self._last_turn = time.monotonic()
+
+    def reset_conversation(self):
+        """Forget the thread (menu action, and whenever the wake word starts a
+        fresh episode after a long gap)."""
+        self._turns = []
 
     def _handle_ask(self, question):
         """Ask-Marvin last stage: send the transcribed question to the local LLM
@@ -460,14 +711,18 @@ class PushToTalkApp:
         from .answer import answer_question
 
         lang = getattr(self.transcriber, "last_language", None)
-        print(f'[ask] question ({lang}): "{question}"', flush=True)
+        history = self._conversation_history()
+        print(f'[ask] question ({lang}, {len(history)//2} prior turns): '
+              f'"{question}"', flush=True)
         try:
-            answer = answer_question(question, self.config)
+            answer = answer_question(question, self.config, history=history)
         except Exception as exc:
             print(f"[ask] answer failed: {exc!r}", flush=True)
             answer = _ASK_UNREACHABLE
         if not answer:
             answer = _ASK_EMPTY
+        else:
+            self._remember_turn(question, answer)
         print(f'[ask] answer: "{answer}"', flush=True)
         if self._on_answer is not None:
             try:

@@ -1,0 +1,108 @@
+# "Hey Marvin" wake word — livekit-wakeword training config.
+# Run it with scripts/train_wakeword.sh (see that script for the environment;
+# training needs torch and friends, which deliberately do NOT go anywhere near
+# the app's runtime venv — the app only needs numpy + onnxruntime to listen).
+model_name: hey_marvin
+
+# Spelling variants widen the pronunciations the model is trained on. The
+# Piper TTS backbone is English-US only, so these approximate the way a Swedish
+# speaker lands on "Marvin" (longer first vowel, softer r) using English
+# orthography, rather than relying on one American reading of the name.
+target_phrases:
+  - "hey marvin"
+  - "hey marvyn"
+  - "hey mahrvin"
+  - "hey marveen"
+
+# ============================================================================
+# Data generation
+# ============================================================================
+
+n_samples: 12000
+n_samples_val: 2000
+n_background_samples: 1500
+n_background_samples_val: 400
+tts_batch_size: 32
+
+# Phrases that must NOT trigger him. Three groups:
+#  1. the bare name — by far the most common false trigger, and the reason the
+#     wake phrase is "hey marvin" and not "marvin" (a 2-syllable bare name
+#     fires constantly in normal speech)
+#  2. names and words that sound like it — "Martin" especially, which is a
+#     very common Swedish name and will be said around this mic often
+#  3. adjacent phrases that share the "hey m..." onset
+custom_negative_phrases:
+  - "marvin"
+  - "mar vin"
+  - "marvin's"
+  - "hey martin"
+  - "martin"
+  - "hey marlin"
+  - "hey marvel"
+  - "hey marvellous"
+  - "hey margin"
+  - "hey darwin"
+  - "hey harvey"
+  - "hey melvin"
+  - "hey calvin"
+  - "hey garvin"
+  - "hey mervyn"
+  - "hey morgan"
+  - "hey mama"
+  - "they marvin"
+  - "hey man"
+  - "hey mate"
+
+# ============================================================================
+# TTS parameters (VITS + SLERP speaker blending)
+# ============================================================================
+
+noise_scales: [0.98]
+noise_scale_ws: [0.98]
+length_scales: [0.75, 1.0, 1.25]
+slerp_weights: [0.2, 0.35, 0.5, 0.65, 0.8]
+
+# ============================================================================
+# Paths — set by train_wakeword.sh
+# ============================================================================
+
+data_dir: ./data
+output_dir: ./output
+
+# ============================================================================
+# Augmentation
+# ============================================================================
+
+augmentation:
+  clip_duration: 2.0
+  batch_size: 16
+  rounds: 3
+  background_paths: [./data/backgrounds]
+  rir_paths: [./data/rirs]
+
+# ============================================================================
+# Model
+# ============================================================================
+
+model:
+  model_type: conv_attention  # best temporal awareness, fewest false positives
+  model_size: medium
+
+# ============================================================================
+# Training
+# ============================================================================
+
+steps: 40000
+learning_rate: 0.0001
+weight_decay: 0.01
+label_smoothing: 0.05
+# This model listens all day in a quiet room next to someone who talks for a
+# living, so false positives cost far more than a missed first try.
+max_negative_weight: 3000
+target_fp_per_hour: 0.1
+
+batch_n_per_class:
+  positive: 50
+  adversarial_negative: 50
+  ACAV100M_sample: 1024
+  background_noise: 50

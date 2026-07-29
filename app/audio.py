@@ -9,6 +9,12 @@ deadlock on an inverted lock order (`AudioOutputUnitStop` parks forever in
 worker holds the busy lock for good so no later dictation can run). Keeping one
 persistent stream removes that teardown from the hot path entirely.
 
+Audio is pulled by a dedicated reader thread doing blocking reads, NOT by a
+PortAudio callback: a Python callback needs the GIL, and this app's AppKit main
+thread holds it often enough to starve one (measured: 16% of realtime delivered,
+with PortAudio reporting no overflow because the samples never reached Python).
+See the Recorder docstring.
+
 Trade-off: the mic stays live (the macOS orange indicator stays on) the whole
 time the app runs. Frames are discarded whenever we're not actively capturing,
 so nothing is retained between dictations.
@@ -25,15 +31,30 @@ import numpy as np
 # shutdown-only close.
 _PA_LOCK = threading.RLock()
 
+# Samples per blocking read (~80 ms at 16 kHz). Matches the wake word's hop so
+# its sliding window advances one read at a time.
+READ_BLOCK = 1280
+
 
 class Recorder:
     """Push-to-talk recorder backed by a single persistent sounddevice.InputStream.
 
-    The stream is opened lazily on the first start() and left running. The
-    callback appends frames only while _capturing is set, so between dictations
-    the mic stays live but nothing is retained. stop() just flips the flag off
-    and returns whatever was captured — it never touches PortAudio, so it cannot
-    deadlock CoreAudio's HAL.
+    The stream is opened lazily on the first start() and left running, and a
+    dedicated reader thread pulls from it. Frames are kept only while
+    _capturing is set, so between dictations the mic stays live but nothing is
+    retained. stop() just flips the flag off and returns whatever was captured
+    — it never touches PortAudio, so it cannot deadlock CoreAudio's HAL.
+
+    Why a reader thread and NOT a PortAudio callback: sounddevice's callback is
+    Python, so it needs the GIL. This app renders Marvin on the AppKit main
+    thread at 20 Hz, and while that holds the GIL the callback simply is not
+    scheduled — measured delivery fell to 16% of realtime, with PortAudio
+    reporting NO overflow because the samples never reached Python at all. The
+    audio kept its nominal rate while losing a third of its samples, which
+    silently corrupts anything assuming continuity (the wake word could not
+    recognise a phrase, and Whisper transcribed the gaps as gibberish).
+    Blocking reads move the buffering into PortAudio's C ring buffer, where a
+    stalled GIL costs latency instead of data: measured 99%.
     """
 
     def __init__(self, sample_rate=16000, channels=1, mic_gain=4.5):
@@ -43,10 +64,44 @@ class Recorder:
         self._frames = []
         self._lock = threading.Lock()
         self._stream = None
+        self._reader_thread = None
+        self._reader_stop = threading.Event()
         self._capturing = False
         self.level = 0.0  # live 0..1 loudness, read by the waveform UI
+        # Optional tap: called with EVERY frame, capturing or not, so a
+        # always-listening consumer (the wake word) can share this one stream
+        # instead of opening a second one — see the module docstring for why a
+        # second PortAudio stream is a bad idea. It runs on the reader thread,
+        # so it should stay cheap: slow work here delays the next read.
+        self.on_frame = None
+        self.overflows = 0      # PortAudio input-overflow events (dropped audio)
+        self.last_status = ""
 
-    def _callback(self, indata, frames, time_info, status):
+    def _reader(self):
+        """Pull audio off the stream on our own thread (see the class docstring
+        for why this is not a PortAudio callback)."""
+        while not self._reader_stop.is_set():
+            stream = self._stream
+            if stream is None:
+                return
+            try:
+                data, overflowed = stream.read(READ_BLOCK)
+            except Exception as exc:
+                if not self._reader_stop.is_set():
+                    print(f"[rec] reader stopped: {exc!r}", flush=True)
+                return
+            if overflowed:
+                self.overflows += 1
+            self._dispatch(data)
+
+    def _dispatch(self, indata):
+        tap = self.on_frame
+        if tap is not None:
+            try:
+                tap(indata)
+            except Exception:
+                # A broken tap must never take the mic down with it.
+                self.on_frame = None
         # The stream runs continuously; drop frames unless a dictation is active.
         if not self._capturing:
             return
@@ -71,6 +126,10 @@ class Recorder:
             if self._stream is not None and self._stream.active:
                 return
             if self._stream is not None:
+                self._reader_stop.set()
+                if self._reader_thread is not None:
+                    self._reader_thread.join(timeout=1.0)
+                    self._reader_thread = None
                 try:
                     self._stream.stop()
                     self._stream.close()
@@ -81,9 +140,24 @@ class Recorder:
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 dtype="float32",
-                callback=self._callback,
             )
             self._stream.start()
+            self._reader_stop.clear()
+            self._reader_thread = threading.Thread(
+                target=self._reader, name="mic-reader", daemon=True
+            )
+            self._reader_thread.start()
+            actual = float(self._stream.samplerate)
+            print(f"[rec] mic stream: {actual:.0f} Hz, {self._stream.channels}ch, "
+                  f"blocksize {self._stream.blocksize}, device "
+                  f"{sd.query_devices(self._stream.device)['name']!r}", flush=True)
+            if abs(actual - self.sample_rate) > 1:
+                # Everything downstream assumes sample COUNTS map to time at
+                # self.sample_rate (Whisper's 30s windows, the wake word's 2s
+                # window). A stream at another rate silently distorts both.
+                print(f"[rec] WARNING: asked for {self.sample_rate} Hz but got "
+                      f"{actual:.0f} Hz — audio will be time-distorted",
+                      flush=True)
 
     def start(self):
         with self._lock:
@@ -115,6 +189,10 @@ class Recorder:
         """Tear the stream down. Shutdown-only — never call on the dictation hot
         path (that teardown is the CoreAudio deadlock this whole design avoids)."""
         self._capturing = False
+        self._reader_stop.set()
+        thread, self._reader_thread = self._reader_thread, None
+        if thread is not None:
+            thread.join(timeout=1.0)
         with _PA_LOCK:
             stream, self._stream = self._stream, None
             if stream is not None:

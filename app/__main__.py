@@ -38,8 +38,45 @@ def build_parser():
     return parser
 
 
+def hold_instance_lock(path=None):
+    """Take the single-instance lock, or return None if another engine holds it.
+
+    Two engines at once is a real failure mode we have hit, not a hypothetical:
+    the log shows a second instance (launched from a stale duplicate bundle)
+    fighting the first — both grab the mic and the hotkey, and whichever saves
+    config.json last clobbers the other's settings. flock() is advisory and
+    dies with the process, so a crash can never leave a stale lock behind.
+    The returned file object must be kept alive for the process lifetime.
+    """
+    import fcntl
+
+    if path is None:
+        path = Path.home() / "Library" / "Logs" / "whisperflow-local" / "engine.lock"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    import os
+
+    f.write(str(os.getpid()))
+    f.flush()
+    return f
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
+
+    lock = hold_instance_lock()
+    if lock is None:
+        print("[app] another WhisperFlow engine is already running — exiting "
+              "(two engines fight over the mic, the hotkeys and config.json)",
+              flush=True)
+        return 0
+    main._lock = lock  # keep the fd alive for the process lifetime
 
     config_path = args.config
     if config_path is None:
