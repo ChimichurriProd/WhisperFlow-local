@@ -97,6 +97,12 @@ class WakeWord:
         self._worker = None
         self._suppressed = False
         self._quiet_until = 0.0
+        # Barge-in mode: while Marvin is SPEAKING, accept a lower score. His
+        # voice on the speakers is competing with the user's shout at the mic
+        # (worst SNR of any moment), and a false positive here only cuts his
+        # own answer short — the cheapest false positive there is.
+        self.barge_threshold = min(0.55, self.threshold)
+        self._barge = False
         self._fed = 0        # samples handed in by the audio callback
         self._dropped = 0    # samples binned by the backpressure cap
         self._model = None
@@ -109,10 +115,12 @@ class WakeWord:
         if self._worker is not None:
             return
         self._stop.clear()
-        self._worker = threading.Thread(
-            target=self._run, name="wakeword", daemon=True
-        )
-        self._worker.start()
+        # Big stack: onnxruntime inference runs here 12.5x/s; a native crash
+        # on this thread has killed the whole app before (see app/threads.py
+        # and the 2026-07-29 DiagnosticReports).
+        from .threads import start_thread
+
+        self._worker = start_thread(self._run, name="wakeword")
 
     def stop(self):
         self._stop.set()
@@ -121,6 +129,12 @@ class WakeWord:
         self._pending = []
         self._pending_len = 0
         self._window.clear()
+
+    def set_barge_mode(self, on):
+        """While Marvin speaks, score against barge_threshold instead of
+        threshold (see __init__ — interrupting him is cheap, missing the
+        user shouting over his own voice is not)."""
+        self._barge = bool(on)
 
     def set_suppressed(self, suppressed):
         """Mute detection (while recording or while Marvin speaks) without
@@ -271,10 +285,11 @@ class WakeWord:
             score = max(scores.values()) if scores else 0.0
             self.last_score = float(score)
             peak = max(peak, score)
-            if score < self.threshold or time.monotonic() < self._quiet_until:
+            thr = self.barge_threshold if self._barge else self.threshold
+            if score < thr or time.monotonic() < self._quiet_until:
                 if self.debug and score >= 0.3:
                     print(f"[wake] near miss {score:.2f} "
-                          f"(threshold {self.threshold})", flush=True)
+                          f"(threshold {thr})", flush=True)
                 continue
             self.hush()
             # Drop the window so the same utterance can't score twice as it

@@ -70,6 +70,9 @@ class Transcriber:
                                    # lets the ask flow skip TTS for non-English.
         self.last_model = None     # model name that produced last_language's text
                                    # (a kb-* name when Swedish routing kicked in)
+        self.last_segments = None  # [(start_s, end_s, text)] of the last
+                                   # transcription — file transcription uses the
+                                   # gaps between them to break paragraphs
 
     def warm(self):
         """Preload the MLX model(s) by pushing half a second of silence through
@@ -121,11 +124,14 @@ class Transcriber:
         # thread that first loaded it cannot be evaluated from another thread
         # ("There is no Stream(gpu, N) in current thread"). on_release spawns a
         # fresh thread per dictation, so we pin ALL MLX work to one persistent
-        # worker thread and block on its result.
+        # worker thread and block on its result. The worker needs a BIG stack:
+        # MLX's graph compiler recurses with graph depth and blew the 512KB
+        # secondary-thread default sky high (SIGBUS in compile_dfs, app dead,
+        # no traceback) — see app/threads.py.
         if self._mlx_pool is None:
-            self._mlx_pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="mlx-stt"
-            )
+            from .threads import single_worker_pool
+
+            self._mlx_pool = single_worker_pool("mlx-stt")
         return self._mlx_pool
 
     def _transcribe_mlx(self, audio):
@@ -184,6 +190,12 @@ class Transcriber:
         text = (result.get("text") or "").strip()
         self.last_language = language or result.get("language")
         self.last_model = model_name
+        self.last_segments = [
+            (float(s.get("start", 0.0)), float(s.get("end", 0.0)),
+             (s.get("text") or "").strip())
+            for s in result.get("segments", [])
+            if (s.get("text") or "").strip()
+        ]
         if language is None and text:
             print(f"[stt] detected language: {result.get('language')}", flush=True)
         return text
@@ -207,9 +219,14 @@ class Transcriber:
             vad_filter=self.vad_filter,
             initial_prompt=self.initial_prompt,
         )
+        segments = list(segments)  # the generator is single-use
         text = " ".join(seg.text.strip() for seg in segments).strip()
         self.last_language = self.language or info.language
         self.last_model = self.model_name  # CPU path has no Swedish specialist
+        self.last_segments = [
+            (float(seg.start), float(seg.end), seg.text.strip())
+            for seg in segments if seg.text.strip()
+        ]
         if self.language is None and text:
             print(f"[stt] detected language: {info.language} "
                   f"(p={info.language_probability:.2f})", flush=True)

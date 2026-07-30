@@ -68,6 +68,10 @@ DEFAULTS = {
         # on an out-of-distribution voice, so this starts stricter. A missed
         # wake word costs a repeat; a false one starts recording mid-meeting.
         "threshold": 0.7,
+        # Threshold while Marvin is SPEAKING: his voice on the speakers is
+        # drowning out the user's "Hey Marvin" at the mic, and a false
+        # positive here merely cuts his own answer short — so accept less.
+        "barge_threshold": 0.55,
         "debounce": 2.0,          # seconds deaf after a detection
         # Hands-free questions have no key to release, so they end on silence.
         # The countdown starts when SPEECH does, never at the beep — otherwise
@@ -87,6 +91,15 @@ DEFAULTS = {
         # ~/Library/Logs/whisperflow-local/wake_dump.wav, so a wake word
         # that will not fire can be diagnosed from what it really heard.
         "dump_seconds": 0,
+    },
+    "files": {
+        # File transcription (drop audio on Marvin). A speech gap longer than
+        # this starts a new paragraph — a 19-min meeting as ONE block of text
+        # is complete but unreadable.
+        "paragraph_gap_seconds": 1.2,
+        # Prefix each paragraph with [m:ss] — only applied to recordings over
+        # two minutes, where the stamps earn their noise.
+        "timestamps": True,
     },
     "injection": {
         "delivery_method": "clipboard",  # "clipboard" | "type"

@@ -211,9 +211,12 @@ class Speaker:
 
     def _executor(self):
         if self._pool is None:
-            self._pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="kokoro-tts"
-            )
+            # Big stack: this thread runs onnxruntime (Kokoro) AND MLX
+            # (Chatterbox) — the same native-recursion crash class as the
+            # mlx-stt worker. See app/threads.py.
+            from .threads import single_worker_pool
+
+            self._pool = single_worker_pool("kokoro-tts")
         return self._pool
 
     def warm(self):

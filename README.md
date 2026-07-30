@@ -264,6 +264,20 @@ the middle of a meeting. Raise it toward 0.85 if it still trips, lower it toward
 > silently never fires. `app/wakeword.py` refuses to start on older versions
 > rather than pretend to listen.
 
+### Stopping him mid-answer
+
+When he mishears you, a wrong answer should cost a second, not a monologue.
+Three ways to cut him off, all equivalent:
+
+- **Click Marvin** — while he's talking, a click means "shut up" (it only
+  cycles the STT model when he's quiet).
+- **Say "Hey Marvin"** — stops him *and* opens a fresh question. While he
+  speaks, detection runs at the lower `wakeword.barge_threshold` (0.55) —
+  his own voice on the speakers is drowning yours out at exactly that
+  moment, and a false positive then merely cuts his own answer short.
+- **Start any recording** — the dictate or ask hotkey silences him first,
+  so his voice never ends up inside your recording.
+
 ### Training the model
 
 The detector is [livekit-wakeword](https://github.com/livekit/livekit-wakeword)
@@ -285,6 +299,30 @@ common Swedish name that will be said near this microphone.
 Training installs its own throwaway venv: it needs torch, torchaudio and ~17GB
 of datasets, none of which belong in the app's environment. The app itself only
 needs `numpy` + `onnxruntime` to listen, and the result is one ~1MB `.onnx`.
+
+## Transcribe audio files
+
+Drop one or more audio files **onto Marvin** (or right-click him →
+"Transkribera ljudfil…"). He transcribes in the background — Swedish through
+KB-Whisper as usual — and writes a `.txt` next to the source, with the full
+text on the clipboard and a bubble when done.
+
+**The gesture decides the grouping:** files dropped *together* become ONE
+combined `.txt` ("`del1 +2 filer.txt`", a `## name (m:ss)` header per
+recording, in drop order); files dropped one at a time each get their own.
+Existing files are never overwritten (`namn 2.txt`).
+
+Transcripts come out as **paragraphs, not a wall of text**: a speech gap
+longer than `files.paragraph_gap_seconds` (1.2s) starts a new paragraph, and
+recordings over two minutes get a `[m:ss]` stamp per paragraph for navigation
+(`files.timestamps`).
+
+Formats: wav, m4a (iPhone voice memos), mp3, aac, aiff, caf, flac — decoded
+with macOS's built-in `afconvert`, no extra installs. Long recordings split
+into ~60s chunks cut at the quietest point, so a dictation started mid-file
+waits seconds, not minutes. Deliberately **no LLM cleanup** on files — the
+cleanup prompt is tuned for short dictations, and recordings deserve the
+faithful transcript (only the hallucination guard + your vocabulary fixes).
 
 ## Verify without a microphone
 

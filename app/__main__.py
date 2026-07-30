@@ -67,6 +67,51 @@ def hold_instance_lock(path=None):
     return f
 
 
+def required_hf_repos(config):
+    """The HuggingFace repos this config's engines will load."""
+    from .stt import _MLX_REPOS
+
+    repos = []
+    stt = config.get("stt", {})
+    if stt.get("engine", "mlx") == "mlx":
+        repos.append(_MLX_REPOS.get(stt.get("model"),
+                                    _MLX_REPOS["large-v3-turbo"]))
+        if stt.get("swedish_model") in _MLX_REPOS:
+            repos.append(_MLX_REPOS[stt["swedish_model"]])
+    cb = (config.get("tts") or {}).get("chatterbox_model")
+    if cb:
+        repos.append(cb)
+        repos.append("mlx-community/S3TokenizerV2")  # chatterbox's tokenizer
+    return repos
+
+
+def maybe_go_offline(config, hub_dir=None):
+    """Set HF_HUB_OFFLINE=1 when every needed model is already cached.
+
+    Without it, huggingface_hub re-validates the cache ON EVERY DICTATION —
+    a network round-trip per utterance in a "fully local" app ("Fetching 4
+    files" spam in the log, and latency spikes on flaky wifi). Only skipped
+    when something is missing, so a first install can still download. Must
+    run BEFORE huggingface_hub is imported (it reads the env at import time).
+    Returns True when offline mode was enabled.
+    """
+    import os
+
+    if os.environ.get("HF_HUB_OFFLINE"):
+        return True
+    hub = Path(hub_dir or Path.home() / ".cache" / "huggingface" / "hub")
+    for repo in required_hf_repos(config):
+        d = hub / ("models--" + repo.replace("/", "--")) / "snapshots"
+        if not (d.is_dir() and any(d.iterdir())):
+            print(f"[app] {repo} not cached yet — staying online for the "
+                  f"download", flush=True)
+            return False
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    print("[app] all models cached — HF_HUB_OFFLINE=1 (no network per "
+          "dictation)", flush=True)
+    return True
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
@@ -87,6 +132,7 @@ def main(argv=None):
                 config_path = candidate
                 break
     config = load_config(config_path)
+    maybe_go_offline(config)
 
     # Imports after arg parsing so --help stays instant.
     if args.menubar:

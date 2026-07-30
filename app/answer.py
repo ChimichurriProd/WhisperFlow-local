@@ -31,21 +31,32 @@ ANSWER_SYSTEM = (
 _LANG_NAMES = {"sv": "Swedish", "en": "English", "es": "Spanish"}
 
 
-def _system_prompt(config):
-    """ANSWER_SYSTEM, plus a hard language override when the user picked a
-    fixed language in the Marvin's-language menu (tts.language != "auto")."""
+def _system_prompt(config, question_lang=None):
+    """ANSWER_SYSTEM plus a HARD language override — always.
+
+    A fixed choice in the Marvin's-language menu wins; otherwise "auto" pins
+    the reply to the language STT DETECTED in the question. The polite "same
+    language as the question" instruction alone was observed failing BOTH ways
+    in the log (English question -> Swedish answer and vice versa) — small
+    models need the explicit sentence, so auto mode now enforces instead of
+    hoping. question_lang comes from the transcriber, so it costs nothing.
+    """
     lang = (config.get("tts") or {}).get("language", "auto")
-    name = _LANG_NAMES.get(lang)
+    name = _LANG_NAMES.get(lang) or _LANG_NAMES.get(
+        (question_lang or "").split("-")[0].lower())
     if not name:
-        return ANSWER_SYSTEM
+        return ANSWER_SYSTEM  # unknown detection: fall back to the polite ask
     return (ANSWER_SYSTEM +
             f"\nOVERRIDE: You MUST write your entire reply in {name}, no "
             f"matter what language the question was asked in. Every sentence "
             f"in {name}.")
 
 
-def answer_question(question, config, history=None):
+def answer_question(question, config, history=None, question_lang=None):
     """Ask the local Ollama model to answer *question*. Returns the answer text.
+
+    question_lang: the language STT detected in the question ("sv"/"en"/...),
+    used to pin the reply language when the menu says "match the question".
 
     Raises requests exceptions (server down) or RuntimeError (Ollama error body,
     e.g. model not pulled); the caller decides how to degrade (the app shows a
@@ -64,7 +75,8 @@ def answer_question(question, config, history=None):
 
     return ollama.generate(
         question,
-        url=url, model=model, system=_system_prompt(config), history=history,
+        url=url, model=model, history=history,
+        system=_system_prompt(config, question_lang=question_lang),
         # A little warmth (vs cleanup's temperature 0) so Marvin has some life.
         temperature=ask.get("temperature", 0.5),
         keep_alive=clean.get("keep_alive", "30m"),

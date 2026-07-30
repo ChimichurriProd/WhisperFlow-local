@@ -142,7 +142,8 @@ try:
         NSWindowCollectionBehaviorCanJoinAllSpaces,
         NSWindowCollectionBehaviorStationary,
     )
-    from Foundation import NSMutableDictionary, NSObject
+    from AppKit import NSPasteboardTypeFileURL
+    from Foundation import NSMutableDictionary, NSObject, NSURL
     import objc
 
     NSWindowStyleMaskBorderless = 0
@@ -272,9 +273,37 @@ try:
             self._down = None
             self._dragged = False
             self._tracking = None
+            # Accept audio files dropped ONTO Marvin (file transcription).
+            self.registerForDraggedTypes_([NSPasteboardTypeFileURL])
             return self
 
         def isFlipped(self):
+            return True
+
+        # -------- drag & drop: audio files onto Marvin --------------------
+
+        def _dropped_audio(self, sender):
+            from .transcribe_file import filter_audio_paths
+
+            pb = sender.draggingPasteboard()
+            urls = pb.readObjectsForClasses_options_([NSURL], None) or []
+            return filter_audio_paths(
+                [str(u.path()) for u in urls if u.isFileURL()])
+
+        def draggingEntered_(self, sender):
+            # 1 = NSDragOperationCopy, 0 = none (drag isn't audio: refuse it
+            # here so Finder shows the no-entry cursor, not a false promise).
+            return 1 if self._dropped_audio(sender) else 0
+
+        def performDragOperation_(self, sender):
+            paths = self._dropped_audio(sender)
+            cb = getattr(self._c, "on_files", None)
+            if not paths or cb is None:
+                return False
+            try:
+                cb(paths)
+            except Exception as exc:
+                print(f"[pill] drop handler failed: {exc!r}", flush=True)
             return True
 
         # -------- hover tracking ------------------------------------------
@@ -375,6 +404,7 @@ try:
                     self._draw_orb_layer(c, w, h, behind=True)
                     self._draw_marvin_image(c, w, h)  # video flipbook / still
                     self._draw_orb_layer(c, w, h, behind=False)
+                    self._draw_progress_ring(c, w, h)
                     return
                 # fallback (no assets): 2D fake tilt/nod on the vector face
                 self._draw_orb_layer(c, w, h, behind=True)
@@ -388,6 +418,7 @@ try:
                 self._draw_marvin_vector(c, w, h)
                 NSGraphicsContext.restoreGraphicsState()
                 self._draw_orb_layer(c, w, h, behind=False)
+                self._draw_progress_ring(c, w, h)
                 return
 
             # subtle dark tint over the frosted glass for contrast + a hairline
@@ -528,6 +559,64 @@ try:
             ).fill()
 
         @objc.python_method
+        def _draw_progress_ring(self, c, w, h):
+            """File-transcription progress: a ring around Marvin's head that
+            fills clockwise from 12 o'clock, in the model colour (the same
+            colour language as the firefly). c.progress is None when no file
+            job is running, so idle costs nothing."""
+            frac = c.progress
+            if frac is None:
+                return
+            frac = max(0.0, min(1.0, float(frac)))
+            color, _ = _model_style(c.model)
+            cr, cg, cb = color
+            cx, cy = w / 2.0, h / 2.0
+            radius = w * 0.315   # just outside the head (~50% of the frame)
+            # Faint full track, so a barely-started ring reads as a gauge.
+            track = NSBezierPath.bezierPath()
+            track.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+                NSMakePoint(cx, cy), radius, 0.0, 360.0, False)
+            _rgb(1, 1, 1, 0.10).setStroke()
+            track.setLineWidth_(3.0)
+            track.stroke()
+            if frac <= 0.001:
+                return
+            # The ring is drawn BY a firefly: the filled arc is its comet
+            # trail (the same layered-halo recipe as _orb_dot), and the tip
+            # is the glowing dot itself, twinkling on the model orb's rhythm
+            # — so the gauge reads as kin to the model firefly, not as a
+            # generic loading bar. The view isFlipped (y grows downward), so
+            # increasing angles run visually CLOCKWISE from 12 o'clock (-90°).
+            end = -90.0 + 360.0 * frac
+            for width, alpha in ((9.0, 0.08), (4.6, 0.20), (2.2, 0.85)):
+                arc = NSBezierPath.bezierPath()
+                arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+                    NSMakePoint(cx, cy), radius, -90.0, end, False)
+                _rgb(cr, cg, cb, alpha).setStroke()
+                arc.setLineWidth_(width)
+                arc.setLineCapStyle_(1)  # round caps
+                arc.stroke()
+            # The freshly-drawn stretch just behind the tip glows hotter
+            # (whitened, like the orb's core) and fades into the trail.
+            recent = min(40.0, 360.0 * frac)
+            if recent > 1.0:
+                hot = (cr + (1 - cr) * 0.45, cg + (1 - cg) * 0.45,
+                       cb + (1 - cb) * 0.45)
+                arc = NSBezierPath.bezierPath()
+                arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+                    NSMakePoint(cx, cy), radius, end - recent, end, False)
+                _rgb(*hot, 0.55).setStroke()
+                arc.setLineWidth_(3.2)
+                arc.setLineCapStyle_(1)
+                arc.stroke()
+            # The firefly at the tip: same halo function, same twinkle beat.
+            ang = math.radians(end)
+            twinkle = 0.82 + 0.18 * math.sin(c._anim * 6.7)
+            r_tip = 4.0 + 0.5 * math.sin(c._anim * 3.1)
+            self._orb_dot(cx + radius * math.cos(ang),
+                          cy + radius * math.sin(ang),
+                          r_tip, color, twinkle)
+
         def _draw_orb_layer(self, c, w, h, behind):
             """One depth layer of the model firefly (path: _orb_orbit, state:
             _tick_orb). The behind pass runs before the head is drawn so the
@@ -834,8 +923,10 @@ try:
 
     class _Pill:
         def __init__(self, on_click=None, on_move=None, on_menu=None, pos=None,
-                     style="waveform", on_double_click=None, skin=None):
+                     style="waveform", on_double_click=None, skin=None,
+                     on_files=None):
             self.on_click = on_click
+            self.on_files = on_files  # audio files dropped on the pill
             self.on_double_click = on_double_click
             self.on_move = on_move
             self.on_menu = on_menu
@@ -843,6 +934,7 @@ try:
             self.mode = "idle"
             self.model = "small"
             self.warming = False  # STT models still loading (grey orb pulse)
+            self.progress = None  # file-transcription fraction (ring), or None
             self.hover = False
             self.skin = skin
             self.center = None
@@ -990,6 +1082,14 @@ try:
             self.model = model
             if changed and self.style == "marvin":
                 self._orb_pop = 1.0      # firefly flare acknowledging the switch
+            self._render()
+
+        def set_progress(self, frac):
+            """File-transcription progress ring: 0..1, or None to hide it.
+            Main thread only (like every pill mutation)."""
+            if frac == self.progress:
+                return
+            self.progress = frac
             self._render()
 
         def set_warming(self, on):
@@ -1272,12 +1372,14 @@ try:
             return self.clips.get(name) if name else None
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
-                    style="waveform", on_double_click=None, skin=None):
+                    style="waveform", on_double_click=None, skin=None,
+                    on_files=None):
         """Build and show the pill. Returns a controller, or None on failure."""
         try:
             return _Pill(on_click=on_click, on_move=on_move,
                          on_menu=on_menu, pos=pos, style=style,
-                         on_double_click=on_double_click, skin=skin)
+                         on_double_click=on_double_click, skin=skin,
+                         on_files=on_files)
         except Exception as exc:  # pragma: no cover - UI environment dependent
             print(f"[pill] disabled ({exc})", flush=True)
             return None
@@ -1288,5 +1390,6 @@ except Exception as _pill_import_err:  # pragma: no cover - AppKit unavailable
     _tb.print_exc()
 
     def create_pill(on_click=None, on_move=None, on_menu=None, pos=None,
-                    style="waveform", on_double_click=None, skin=None):
+                    style="waveform", on_double_click=None, skin=None,
+                    on_files=None):
         return None

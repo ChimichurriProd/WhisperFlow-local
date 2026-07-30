@@ -70,6 +70,7 @@
     "enabled": false,
     "phrase": "Hey Marvin",
     "threshold": 0.7,
+    "barge_threshold": 0.55,
     "debug": false,
     "silence_seconds": 0.9,
     "dump_seconds": 0,

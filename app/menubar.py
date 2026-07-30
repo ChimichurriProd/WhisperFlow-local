@@ -132,6 +132,9 @@ class MenuBarApp(rumps.App):
         # marshals them to the main-thread pill timer (AppKit is main-only).
         self._bubble = None
         self._pending_answer = None
+        # One-line status bubbles (file transcription) — bubble only,
+        # no TTS, no oracle turn. Set from worker threads, shown here.
+        self._pending_notice = None
         # Two-faced Marvin: an ask episode turns him around to his 'oracle' back
         # face for the whole question, then back to the front 'scribe' when done.
         # _ask_started is set (off-thread) the moment an ask recording begins;
@@ -163,7 +166,8 @@ class MenuBarApp(rumps.App):
         self._menu_target = _MenuTarget.alloc().initWithApp_(self)
         self._menu_callbacks = []
         self.pill = create_pill(
-            on_click=self.cycle_model, on_move=self._save_pill_pos,
+            on_click=self._pill_clicked, on_move=self._save_pill_pos,
+            on_files=self._transcribe_dropped,
             on_menu=self.show_pill_menu, pos=pos,
             style=config.get("ui", {}).get("pill_style", "waveform"),
             on_double_click=self._marvin_speak,
@@ -214,6 +218,13 @@ class MenuBarApp(rumps.App):
                 self._show_answer(*pending)
             except Exception as exc:
                 print(f"[ask] show failed: {exc!r}", flush=True)
+        notice = self._pending_notice
+        if notice is not None:
+            self._pending_notice = None
+            try:
+                self._show_notice(notice)
+            except Exception as exc:
+                print(f"[file] notice failed: {exc!r}", flush=True)
         if self._bubble is not None:
             self._bubble.tick()  # auto-dismiss once its time is up
 
@@ -254,6 +265,11 @@ class MenuBarApp(rumps.App):
 
         if self.pill is None:
             return
+        # File-transcription ring: mirror the engine's fraction onto the pill.
+        prog = getattr(self.engine, "file_progress", None)
+        if hasattr(self.pill, "set_progress") and prog != getattr(
+                self.pill, "progress", None):
+            self.pill.set_progress(prog)
         # blocked shows as idle; paused = Marvin dozes off (sleep clip), else idle.
         if mode == "paused" and self.pill.style == "marvin":
             pill_mode = "sleep"
@@ -271,6 +287,15 @@ class MenuBarApp(rumps.App):
                 and not any(v > 0.001 for v in self.pill.levels)):
             return
         self.pill.tick(pill_mode, level)
+
+    def _pill_clicked(self):
+        """Single click on Marvin. While he's talking it means "shut up" —
+        poking him mid-monologue must never ALSO switch the STT model, so the
+        model cycle only happens when he's quiet."""
+        if self.engine.stop_speaking():
+            print("[speak] cut off by click", flush=True)
+            return
+        self.cycle_model()
 
     def cycle_model(self):
         values = [v for v, _ in MODEL_CHOICES]
@@ -695,7 +720,8 @@ class MenuBarApp(rumps.App):
             except Exception:
                 pass
         self.pill = create_pill(
-            on_click=self.cycle_model, on_move=self._save_pill_pos,
+            on_click=self._pill_clicked, on_move=self._save_pill_pos,
+            on_files=self._transcribe_dropped,
             on_menu=self.show_pill_menu, pos=pos, style=style,
             on_double_click=self._marvin_speak,
         )
@@ -831,6 +857,8 @@ class MenuBarApp(rumps.App):
             lambda: self.engine.reset_conversation(), menu,
             enabled=turns > 0)
         add("Ask Marvin…", lambda: self._ask_prompt(), menu)
+        add("Transkribera ljudfil…",
+            lambda: self._pick_files_to_transcribe(), menu)
 
         cleanup_on = self.config["cleanup"].get("enabled", True)
         add("AI cleanup", lambda: self._apply_cleanup(not cleanup_on), menu,
@@ -873,6 +901,74 @@ class MenuBarApp(rumps.App):
             self.pill.set_model(value)
         self._save_config()
         rumps.notification("WhisperFlow", "Model changed", f"Now using: {value}")
+
+    # ---------------- file transcription (drop on Marvin / menu) ----------
+
+    def _show_notice(self, text):
+        """A plain bubble by Marvin — no voice, no oracle turn (that language
+        is reserved for answers; this is just status)."""
+        if self._bubble is None:
+            from .bubble import create_bubble
+
+            self._bubble = create_bubble()
+        if self._bubble is not None and self.pill is not None:
+            f = self.pill.window.frame()
+            self._bubble.show(text, (float(f.origin.x), float(f.origin.y),
+                                     float(f.size.width), float(f.size.height)))
+        else:
+            try:
+                rumps.notification("Marvin", "", text)
+            except Exception:
+                pass
+
+    def _transcribe_dropped(self, paths):
+        """Audio files landed on Marvin (or came from the picker): transcribe
+        in the background. Dropped TOGETHER = one combined .txt; the gesture
+        is the grouping."""
+        n = len(paths)
+        print(f"[file] {n} fil(er) mottagna", flush=True)
+        if self.pill is not None:
+            try:
+                self.pill.play_oneshot("curious")   # he perks up at the drop
+            except Exception:
+                pass
+        self._pending_notice = (f"Transkriberar {n} filer…" if n > 1
+                                else "Transkriberar…")
+        self.engine.transcribe_files_async(paths, on_done=self._files_done)
+
+    def _files_done(self, res):
+        """Worker thread: park the outcome for the main-thread pill timer."""
+        if res is None:
+            self._pending_notice = "Transkriberingen misslyckades — se loggen."
+            return
+        from pathlib import Path
+
+        from .injection import _set_clipboard_text
+        from .transcribe_file import format_duration
+
+        try:
+            _set_clipboard_text(res["text"])
+            clip = " · kopierad till urklipp"
+        except Exception:
+            clip = ""
+        self._pending_notice = (
+            f"Klart: {res['n']} fil(er), {format_duration(res['seconds'])} → "
+            f"{Path(res['out_path']).name}{clip}")
+
+    def _pick_files_to_transcribe(self):
+        """Menu path to the same pipeline: a multi-select open panel."""
+        from AppKit import NSOpenPanel
+
+        from .transcribe_file import AUDIO_EXTS
+
+        panel = NSOpenPanel.openPanel()
+        panel.setAllowsMultipleSelection_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowedFileTypes_(sorted(e.lstrip(".") for e in AUDIO_EXTS))
+        if panel.runModal():
+            paths = [str(u.path()) for u in panel.URLs()]
+            if paths:
+                self._transcribe_dropped(paths)
 
     def _save_config(self):
         if not self.config_path:

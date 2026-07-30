@@ -45,6 +45,36 @@ class Delegate: NSObject, NSApplicationDelegate {
     var aliveIcon: NSImage?
     var deadIcon: NSImage?
     let statusLine = NSMenuItem(title: "Checking…", action: nil, keyEquivalent: "")
+    // Auto-revive after a CRASH (never after a manual stop): the engine has
+    // died to native bugs in ML libraries (SIGBUS in mlx, SIGSEGV in
+    // onnxruntime — see ~/Library/Logs/DiagnosticReports/Python-*.ips), and a
+    // dictation app that stays silently dead is worse than a 3-second hiccup.
+    var lastAliveAt = Date.distantPast
+    var manualStop = false
+    var revives: [Date] = []
+
+    func freshCrashReport() -> Bool {
+        // Only a crash leaves a Python-*.ips newer than when we last saw the
+        // engine alive — a manual quit leaves nothing, so we stay quiet then.
+        let dir = NSHomeDirectory() + "/Library/Logs/DiagnosticReports"
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return false }
+        let cutoff = lastAliveAt.addingTimeInterval(-60)
+        for n in names where n.hasPrefix("Python-") && n.hasSuffix(".ips") {
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: dir + "/" + n),
+               let m = attrs[.modificationDate] as? Date, m > cutoff, lastAliveAt > .distantPast {
+                return true
+            }
+        }
+        return false
+    }
+
+    func maybeRevive() {
+        revives.removeAll { $0 < Date().addingTimeInterval(-600) }
+        guard !manualStop, revives.count < 3, freshCrashReport() else { return }
+        revives.append(Date())
+        statusLine.title = "WhisperFlow: crashed — auto-restarting (\(revives.count)/3)"
+        run("/usr/bin/open", [appPath])
+    }
 
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -83,6 +113,8 @@ class Delegate: NSObject, NSApplicationDelegate {
 
     func tick() {
         if let pid = enginePid() {
+            lastAliveAt = Date()
+            manualStop = false
             statusLine.title = "WhisperFlow: running (pid \(pid))"
             item.button?.image = aliveIcon
             item.button?.toolTip = "WhisperFlow is running"
@@ -90,10 +122,12 @@ class Delegate: NSObject, NSApplicationDelegate {
             statusLine.title = "WhisperFlow: NOT running"
             item.button?.image = deadIcon
             item.button?.toolTip = "WhisperFlow is NOT running — click to restart"
+            maybeRevive()
         }
     }
 
     @objc func restartEngine() {
+        manualStop = false
         run("/usr/bin/pkill", ["-9", "-f", "--", enginePattern])
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
             run("/usr/bin/open", [appPath])
@@ -102,6 +136,7 @@ class Delegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func forceQuitEngine() {
+        manualStop = true   // the user chose this — never auto-revive it
         run("/usr/bin/pkill", ["-9", "-f", "--", enginePattern])
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.tick() }
     }

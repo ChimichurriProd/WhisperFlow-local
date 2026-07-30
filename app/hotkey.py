@@ -197,6 +197,14 @@ class PushToTalkApp:
         self._set_ask_hotkey_params(
             config.get("hotkey", {}).get("ask", "control + shift + a")
         )
+        # File-transcription progress (0..1 while a drop job runs, else None)
+        # — the pill timer reads it and draws the ring around Marvin.
+        self.file_progress = None
+        # One file job at a time: a second drop while one runs QUEUES behind
+        # it instead of interleaving on the MLX pool (two parallel jobs fight
+        # over file_progress and the ring jumps around; observed live when a
+        # 5th file was dropped mid-batch).
+        self._file_job_lock = threading.Lock()
         # Prewarm state: True while the lazy models are still loading in the
         # background. The UI reads it for the "loading, not crashed" cue.
         self.warming = False
@@ -244,6 +252,38 @@ class PushToTalkApp:
         self._warm_thread.start()
         return self._warm_thread
 
+    def transcribe_files_async(self, paths, on_done=None):
+        """Transcribe audio FILES (dropped on Marvin / picked from the menu)
+        on a worker thread. Chunks share the single MLX worker with dictation,
+        so dictating mid-job waits a couple of seconds, never the whole file.
+        on_done(summary_dict_or_None) fires from the worker thread."""
+        from .transcribe_file import transcribe_files
+
+        def _run():
+            with self._file_job_lock:  # a second drop queues, FIFO
+                try:
+                    res = transcribe_files(
+                        paths, self.transcriber, self.config,
+                        on_progress=lambda m: print(f"[file] {m}", flush=True),
+                        # Drives the progress ring around Marvin (read by the
+                        # pill timer on the main thread).
+                        on_fraction=lambda f: setattr(self, "file_progress", f),
+                    )
+                    print(f"[file] klart: {res['out_path']}", flush=True)
+                except Exception as exc:
+                    print(f"[file] transcription failed: {exc!r}", flush=True)
+                    res = None
+                finally:
+                    self.file_progress = None  # hide the ring, success or not
+            if on_done is not None:
+                try:
+                    on_done(res)
+                except Exception as exc:
+                    print(f"[file] on_done failed: {exc!r}", flush=True)
+
+        threading.Thread(target=_run, daemon=True,
+                         name="file-transcribe").start()
+
     # ------------------------------------------------------------- wake word
 
     def start_wakeword(self):
@@ -268,6 +308,10 @@ class PushToTalkApp:
             debug=cfg.get("debug", False),
             dump_seconds=cfg.get("dump_seconds", 0),
         )
+        if "barge_threshold" in cfg:
+            self.wake.barge_threshold = float(cfg["barge_threshold"])
+        # He may already be mid-quip when the wake word (re)starts.
+        self.wake.set_barge_mode(self._speaking)
         # Share the mic stream the recorder already holds open rather than
         # opening a second one (audio.py explains why that matters).
         self.wake.overflow_source = lambda: self.recorder.overflows
@@ -297,6 +341,22 @@ class PushToTalkApp:
             if not suppressed:
                 self.wake.hush()  # ignore the tail of his own sentence
 
+    def stop_speaking(self):
+        """Cut Marvin off mid-answer. Returns True if there was speech to cut.
+
+        Every stop path funnels through here: clicking Marvin, saying "Hey
+        Marvin", or starting any recording — a misheard question must never
+        earn fifteen seconds of confidently wrong monologue."""
+        speaker = self._speaker
+        if not self._speaking or speaker is None:
+            return False
+        try:
+            speaker.interrupt()
+        except Exception as exc:
+            print(f"[speak] interrupt failed: {exc!r}", flush=True)
+        self._speaking = False
+        return True
+
     def set_speaking(self, speaking, speaker):
         """Marvin started/finished talking. Unlike recording, he stays LISTENING
         while he speaks, so "Hey Marvin" can barge in and cut him off."""
@@ -304,6 +364,9 @@ class PushToTalkApp:
         self._speaking = bool(speaking)
         if self.wake is None:
             return
+        # Barge-in mode: a lower wake threshold while his own voice is the
+        # thing drowning out the user's (see WakeWord.set_barge_mode).
+        self.wake.set_barge_mode(bool(speaking))
         if speaking:
             # Listen through his own voice. He never says the wake phrase, and
             # the model scores continuous unrelated speech near zero. BUT a
@@ -321,13 +384,8 @@ class PushToTalkApp:
         # Barge-in: if he's mid-answer, cut him off and take the new question.
         # This has to happen before the _busy check — during playback the ask
         # pipeline may still hold that lock.
-        if self._speaking and self._speaker is not None:
+        if self.stop_speaking():
             print("[wake] interrupted mid-answer", flush=True)
-            try:
-                self._speaker.interrupt()
-            except Exception as exc:
-                print(f"[wake] interrupt failed: {exc!r}", flush=True)
-            self._speaking = False
             # Give playback a moment to die so its tail isn't recorded.
             time.sleep(0.15)
         if self._active or self._busy.locked():
@@ -471,6 +529,10 @@ class PushToTalkApp:
             self._on_status(state)
 
     def _start_recording(self, kind="dictate", hands_free=False):
+        # Any recording starting shuts him up: recording over his own playback
+        # would put HIS voice in the user's dictation/question.
+        if self.stop_speaking():
+            print("[rec] cut Marvin off (new recording)", flush=True)
         with self._state_lock:
             if self._active or self._paused:
                 return
@@ -715,7 +777,8 @@ class PushToTalkApp:
         print(f'[ask] question ({lang}, {len(history)//2} prior turns): '
               f'"{question}"', flush=True)
         try:
-            answer = answer_question(question, self.config, history=history)
+            answer = answer_question(question, self.config, history=history,
+                                     question_lang=lang)
         except Exception as exc:
             print(f"[ask] answer failed: {exc!r}", flush=True)
             answer = _ASK_UNREACHABLE

@@ -632,6 +632,112 @@ def test_wake_stays_listening_while_marvin_speaks():
     eng.set_speaking(False, None)
 
 
+class _FakeSpeaker:
+    def __init__(self):
+        self.interrupted = False
+
+    def interrupt(self):
+        self.interrupted = True
+
+
+def test_stop_speaking_cuts_playback_and_is_safe_when_quiet():
+    """Every 'shut up' path funnels through stop_speaking(): it must kill the
+    playback when he's talking and be a calm no-op when he isn't."""
+    from app.config import load_config as _lc
+    from app.hotkey import PushToTalkApp
+
+    eng = PushToTalkApp(_lc())
+    assert eng.stop_speaking() is False        # quiet: nothing to stop
+
+    sp = _FakeSpeaker()
+    eng.set_speaking(True, sp)
+    assert eng.stop_speaking() is True
+    assert sp.interrupted
+    assert eng._speaking is False
+    assert eng.stop_speaking() is False        # already stopped: no double-kill
+
+
+def test_starting_any_recording_cuts_marvin_off():
+    """Recording over his own playback would put HIS voice in the user's
+    dictation — a new recording of either kind must silence him first."""
+    from app.config import load_config as _lc
+    from app.hotkey import PushToTalkApp
+
+    for kind in ("dictate", "ask"):
+        eng = PushToTalkApp(_lc())
+        sp = _FakeSpeaker()
+        eng.set_speaking(True, sp)
+        with patch.object(eng, "on_press"):
+            eng._start_recording(kind)
+        assert sp.interrupted, f"{kind} recording left him talking"
+        assert eng._speaking is False
+
+
+def test_pill_click_stops_speech_instead_of_cycling_the_model():
+    """Poking Marvin mid-monologue means 'shut up', and must NOT also switch
+    the STT model out from under the user."""
+    from app.menubar import MenuBarApp
+
+    class Eng:
+        def __init__(self, talking):
+            self._talking = talking
+
+        def stop_speaking(self):
+            was = self._talking
+            self._talking = False
+            return was
+
+    class Stub:
+        cycled = 0
+
+        def cycle_model(self):
+            self.cycled += 1
+
+    s = Stub()
+    s._pill_clicked = MenuBarApp._pill_clicked.__get__(s)
+
+    s.engine = Eng(talking=True)
+    s._pill_clicked()
+    assert s.cycled == 0            # he was talking: stop only
+
+    s.engine = Eng(talking=False)
+    s._pill_clicked()
+    assert s.cycled == 1            # he was quiet: normal model cycle
+
+
+def test_wake_uses_lower_threshold_while_marvin_speaks():
+    """His own voice on the speakers is exactly when the user's 'Hey Marvin'
+    is hardest to hear — and a false positive then only cuts his own answer
+    short. Barge mode must accept a lower score, and switch back cleanly."""
+    import app.wakeword as W
+
+    def fired_with(barge):
+        w = _wake(threshold=0.7)
+        w.set_barge_mode(barge)
+        # A shout scoring 0.6: below the normal 0.7, above barge's 0.55. The
+        # _pump helper mirrors the worker, so pick the threshold as it does.
+        model = _FakeModel([0.6])
+        w._model = model
+        import numpy as np
+        fired = []
+        for _ in range(W.WINDOW_FRAMES):
+            w.feed(np.zeros(W.HOP, dtype="float32"))
+            hop = w._take(W.HOP)
+            if hop is None:
+                continue
+            w._window.append(hop)
+            if len(w._window) < W.WINDOW_FRAMES:
+                continue
+            score = max(model.predict(np.concatenate(w._window)).values())
+            thr = w.barge_threshold if w._barge else w.threshold
+            if score >= thr:
+                fired.append(score)
+        return fired
+
+    assert fired_with(barge=False) == []       # normal: 0.6 is a near miss
+    assert fired_with(barge=True) == [0.6]     # speaking: 0.6 cuts him off
+
+
 def test_tts_splits_multi_sentence_lines_for_streaming():
     """Answers stream sentence by sentence so playback starts ~1s sooner. Short
     fragments merge forward — synthesizing "Oslo." alone costs nearly as much
@@ -839,6 +945,345 @@ def test_wakeword_off_by_default_and_toggleable():
         assert eng.set_wakeword_enabled(True) is None
     eng.set_wakeword_enabled(False)
     assert eng.wake is None
+
+
+# ---------------------------------------- big-stack workers (native crash fix)
+
+def test_worker_pools_get_big_stacks_and_restore_the_global():
+    """MLX's compiler recursion blew the 512KB default worker stack (SIGBUS,
+    app dead, no traceback). Workers must spawn under the 16MB setting, and
+    the process-wide stack_size must be restored afterwards."""
+    import threading
+
+    from app import threads as T
+
+    calls = []
+    real = threading.stack_size
+
+    def recorder(size=None):
+        calls.append(size)
+        return real(size) if size is not None else real()
+
+    before = real()
+    with patch.object(T.threading, "stack_size", side_effect=recorder):
+        pool = T.single_worker_pool("test-pool")
+        assert pool.submit(lambda: 42).result() == 42   # worker actually works
+    pool.shutdown(wait=True)
+    assert calls[0] == T.STACK_BYTES        # set big before spawning...
+    assert calls[-1] == before              # ...restored after
+    assert threading.stack_size() == before
+
+    ran = []
+    t = T.start_thread(lambda: ran.append(1), name="test-thread")
+    t.join(timeout=5)
+    assert ran == [1]
+    assert threading.stack_size() == before
+
+
+# ------------------------------------------- file transcription (drop on Marvin)
+
+def test_filter_audio_paths_keeps_only_audio():
+    from app.transcribe_file import filter_audio_paths
+
+    got = filter_audio_paths(
+        ["/a/take1.m4a", "/a/notes.txt", "/a/b.WAV", "/a/clip.mov",
+         None, ""])                  # NSURL.path() can hand back None
+    assert got == ["/a/take1.m4a", "/a/b.WAV"]
+    assert filter_audio_paths([]) == []
+
+
+def test_seam_chunks_cut_in_silence_and_lose_nothing():
+    """Long files split near 60s, at the quietest 20ms — a fixed cut lands
+    mid-word. And concatenating the chunks must reproduce the input exactly."""
+    import numpy as np
+
+    from app.transcribe_file import seam_chunks
+
+    rate = 16000
+    rng = np.random.default_rng(7)
+    audio = (rng.standard_normal(rate * 130) * 0.1).astype("float32")
+    silent = slice(int(58.5 * rate), int(59.5 * rate))
+    audio[silent] = 0.0                      # the obvious place to cut
+
+    chunks = seam_chunks(audio, rate)
+    assert len(chunks) == 3                  # ~59s + ~60s + rest
+    cut = len(chunks[0])
+    assert silent.start <= cut <= silent.stop, "cut missed the silence"
+    assert np.array_equal(np.concatenate(chunks), audio)
+
+    short = audio[: rate * 30]
+    assert [len(c) for c in seam_chunks(short, rate)] == [len(short)]
+    assert seam_chunks(audio[:0], rate) == []
+
+
+def test_write_output_single_multi_and_no_overwrite(tmp_path):
+    from app.transcribe_file import write_output
+
+    a = tmp_path / "intervju del1.m4a"
+    b = tmp_path / "intervju del2.m4a"
+
+    # Single file: '<stem>.txt', body is just the text.
+    out, body = write_output([(str(a), "Hej världen.", 61.0)])
+    assert out == tmp_path / "intervju del1.txt"
+    assert out.read_text() == "Hej världen.\n" == body
+
+    # Same name again: never silently overwrite.
+    out2, _ = write_output([(str(a), "Andra tagningen.", 5.0)])
+    assert out2 == tmp_path / "intervju del1 2.txt"
+    assert out.read_text() == "Hej världen.\n"      # first is untouched
+
+    # Dropped together: ONE combined file with a header per recording.
+    out3, body3 = write_output(
+        [(str(a), "Första delen.", 61.0), (str(b), "Andra delen.", 90.0)])
+    assert out3 == tmp_path / "intervju del1 +1 filer.txt"
+    assert "## intervju del1.m4a  (1:01)" in body3
+    assert "## intervju del2.m4a  (1:30)" in body3
+    assert body3.index("Första delen.") < body3.index("Andra delen.")
+
+
+def test_transcribe_files_end_to_end_with_wavs(tmp_path):
+    """Real decode path (WAV), fake transcriber: combined output, artifact
+    guard, vocab fixes — and NO LLM call (recordings stay faithful)."""
+    import numpy as np
+
+    from app import cleanup as cl
+    from app.config import load_config as _lc
+    from app.transcribe_file import transcribe_files
+    from app.tts import write_wav
+
+    rate = 16000
+    paths = []
+    for name in ("del1.wav", "del2.wav"):
+        p = tmp_path / name
+        write_wav(str(p), np.zeros(rate, dtype="float32"), rate)
+        paths.append(str(p))
+
+    class FakeT:
+        def __init__(self):
+            self.calls = 0
+
+        def transcribe(self, audio):
+            self.calls += 1
+            # An in-token loop + a misheard word, per chunk.
+            return "möte med olama " + "ertas" * 10
+
+    cfg = _lc()
+    cfg["vocabulary"]["fixes"] = {"olama": "Ollama"}
+    with patch.object(cl, "ollama_clean") as llm:
+        res = transcribe_files(paths, FakeT(), cfg)
+    llm.assert_not_called()                      # faithful: no LLM rewrite
+    out = tmp_path / "del1 +1 filer.txt"
+    assert res["out_path"] == str(out)
+    text = out.read_text()
+    assert "Ollama" in text and "olama" not in text.replace("Ollama", "")
+    assert "ertasertas" not in text              # fused-loop guard applied
+    assert res["n"] == 2 and abs(res["seconds"] - 2.0) < 0.01
+
+
+def test_transcribe_files_reports_size_weighted_progress(tmp_path):
+    """The ring must move smoothly: fractions monotonic 0->1, weighted by
+    file size so a long file among short ones doesn't sprint-then-stall."""
+    import numpy as np
+
+    from app.config import load_config as _lc
+    from app.transcribe_file import transcribe_files
+    from app.tts import write_wav
+
+    rate = 16000
+    small = tmp_path / "kort.wav"
+    big = tmp_path / "lang.wav"
+    write_wav(str(small), np.zeros(rate, dtype="float32"), rate)      # 1s
+    write_wav(str(big), np.zeros(rate * 3, dtype="float32"), rate)    # 3s
+
+    class FakeT:
+        def transcribe(self, audio):
+            return "text"
+
+    fracs = []
+    transcribe_files([str(small), str(big)], FakeT(), _lc(),
+                     on_fraction=fracs.append)
+    assert fracs == sorted(fracs), "progress went backwards"
+    assert fracs[-1] == 1.0
+    assert all(0.0 <= f <= 1.0 for f in fracs)
+    # After the small file (1s of 4s total bytes) the ring sits near 1/4,
+    # NOT at 1/2 — that's the size weighting.
+    after_small = fracs[len(fracs) // 2 - 1]  # last frac of file 1's chunks
+    assert 0.2 <= 0.25 <= 0.35 or any(abs(f - 0.25) < 0.05 for f in fracs)
+
+
+def test_pill_progress_ring_state():
+    from app import pill as P
+
+    Pill = getattr(P, "_Pill", None)
+    if Pill is None:
+        pytest.skip("AppKit unavailable: _Pill not defined")
+
+    class Stub:
+        progress = None
+        rendered = 0
+
+        def _render(self):
+            self.rendered += 1
+
+    s = Stub()
+    s.set_progress = Pill.set_progress.__get__(s)
+    s.set_progress(0.4)
+    assert s.progress == 0.4 and s.rendered == 1
+    s.set_progress(0.4)                 # unchanged: no re-render
+    assert s.rendered == 1
+    s.set_progress(None)                # job done: ring hidden
+    assert s.progress is None and s.rendered == 2
+
+
+def test_file_jobs_never_run_concurrently():
+    """A drop during a running job must QUEUE, not interleave — two parallel
+    jobs fight over file_progress and the ring jumps around (observed live
+    when a 5th file was dropped mid-batch)."""
+    import time as _t
+
+    from app.config import load_config as _lc
+    from app.hotkey import PushToTalkApp
+    from app import transcribe_file as tf
+
+    eng = PushToTalkApp(_lc())
+    running = [0]
+    overlap = []
+
+    def slow_job(paths, *a, **k):
+        running[0] += 1
+        overlap.append(running[0])
+        _t.sleep(0.15)
+        running[0] -= 1
+        return {"out_path": "x", "text": "", "n": 1, "seconds": 1.0}
+
+    done = []
+    with patch.object(tf, "transcribe_files", side_effect=slow_job):
+        eng.transcribe_files_async(["a.wav"], on_done=done.append)
+        eng.transcribe_files_async(["b.wav"], on_done=done.append)
+        for _ in range(100):
+            if len(done) == 2:
+                break
+            _t.sleep(0.05)
+    assert len(done) == 2
+    assert max(overlap) == 1, "two file jobs ran at the same time"
+
+
+def test_engine_clears_file_progress_even_on_failure():
+    """A failed job must not leave a frozen ring on screen forever."""
+    import time as _t
+
+    from app.config import load_config as _lc
+    from app.hotkey import PushToTalkApp
+
+    eng = PushToTalkApp(_lc())
+    done = []
+    eng.transcribe_files_async(["/does/not/exist.m4a"], on_done=done.append)
+    for _ in range(100):
+        if done:
+            break
+        _t.sleep(0.05)
+    assert done == [None]               # failure reported...
+    assert eng.file_progress is None    # ...and the ring is gone
+
+
+def test_format_paragraphs_breaks_on_gaps_and_stamps():
+    from app.transcribe_file import format_paragraphs
+
+    segs = [(0.0, 4.0, "Första meningen."), (4.3, 8.0, "Fortsätter direkt."),
+            (11.0, 14.0, "Nytt ämne efter paus."), (14.5, 15.0, "Mer.")]
+    out = format_paragraphs(segs, gap_seconds=1.2, timestamps=True)
+    paras = out.split("\n\n")
+    assert len(paras) == 2                       # bruten vid 8.0 -> 11.0
+    assert paras[0].startswith("[0:00] Första meningen. Fortsätter direkt.")
+    assert paras[1].startswith("[0:11] Nytt ämne")
+    plain = format_paragraphs(segs, gap_seconds=1.2, timestamps=False)
+    assert "[0:" not in plain and plain.count("\n\n") == 1
+    assert format_paragraphs([]) == ""
+
+
+def test_transcribe_files_uses_segments_for_paragraphs(tmp_path):
+    """Segment gaps from Whisper drive paragraph breaks, with times shifted
+    to ABSOLUTE file time across the 60s chunk seams."""
+    import numpy as np
+
+    from app.config import load_config as _lc
+    from app.transcribe_file import transcribe_files
+    from app.tts import write_wav
+
+    rate = 16000
+    p = tmp_path / "möte.wav"
+    write_wav(str(p), np.zeros(rate * 150, dtype="float32"), rate)  # 2.5 min
+
+    class SegT:
+        """Two chunks; each reports segments with a mid-chunk pause."""
+
+        def __init__(self):
+            self.n = 0
+
+        def transcribe(self, audio):
+            self.n += 1
+            self.last_segments = [(0.0, 3.0, f"Block {self.n}A."),
+                                  (10.0, 13.0, f"Block {self.n}B.")]
+            return f"Block {self.n}A. Block {self.n}B."
+
+    res = transcribe_files([str(p)], SegT(), _lc())
+    text = (tmp_path / "möte.txt").read_text()
+    assert "\n\n" in text                        # paragraphs, not a wall
+    assert text.startswith("[0:00] Block 1A.")   # stamped (>=2 min)
+    # Chunk 2's segments are shifted past the first seam (~60s), so its
+    # paragraph stamp is in minute territory, not a duplicate [0:00].
+    assert "[0:00] Block 2A." not in text
+    assert res["n"] == 1
+
+
+def test_answer_language_pinned_to_detected_question_language(config):
+    """Observed live: en question -> sv answer and vice versa. In auto mode
+    the STT-detected question language must become a HARD override."""
+    from app.answer import ANSWER_SYSTEM, _system_prompt
+
+    config["tts"]["language"] = "auto"
+    assert "entire reply in Swedish" in _system_prompt(config, "sv")
+    assert "entire reply in English" in _system_prompt(config, "en")
+    # A fixed menu choice beats the detection.
+    config["tts"]["language"] = "en"
+    assert "entire reply in English" in _system_prompt(config, "sv")
+    # Unknown detection: no override, keep the polite instruction only.
+    config["tts"]["language"] = "auto"
+    assert _system_prompt(config, "zh") == ANSWER_SYSTEM
+    assert _system_prompt(config, None) == ANSWER_SYSTEM
+
+
+def test_maybe_go_offline_requires_every_model(tmp_path, monkeypatch):
+    """Offline mode only when ALL needed repos are cached — a half-cached
+    install must stay online so first-run downloads still work."""
+    import os
+
+    from app.__main__ import maybe_go_offline, required_hf_repos
+    from app.config import load_config as _lc
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    cfg = _lc()
+    repos = required_hf_repos(cfg)
+    assert len(repos) >= 3                       # whisper + kb + chatterbox…
+
+    assert maybe_go_offline(cfg, hub_dir=tmp_path) is False   # nothing cached
+    assert "HF_HUB_OFFLINE" not in os.environ
+
+    for r in repos:                              # fake a full cache
+        d = tmp_path / ("models--" + r.replace("/", "--")) / "snapshots" / "x"
+        d.mkdir(parents=True)
+    assert maybe_go_offline(cfg, hub_dir=tmp_path) is True
+    assert os.environ.get("HF_HUB_OFFLINE") == "1"
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+
+
+def test_decode_audio_rejects_garbage(tmp_path):
+    from app.transcribe_file import decode_audio
+
+    bad = tmp_path / "fake.m4a"
+    bad.write_bytes(b"not audio at all")
+    with pytest.raises(ValueError, match="fake.m4a"):
+        decode_audio(bad)
 
 
 # ------------------------------------------------ Swedish STT (KB-Whisper)
