@@ -22,7 +22,7 @@ die()  { echo "  ${RED}✗ $*${RESET}"; echo; echo "Installation stopped. Fix th
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/Library/WhisperFlow"          # TCC-safe runtime location
 APPDIR="$HOME/Applications"
-LLM_MODEL="llama3.1:8b"
+LLM_MODEL="gemma4:12b"
 
 clear
 echo "${BOLD}WhisperFlow installer${RESET}"
@@ -67,7 +67,7 @@ PYVER="$("$PY" -c 'import sys;print("python%d.%d"%sys.version_info[:2])')"
 # --- 3. Runtime files -----------------------------------------------------
 step "Installing app files to $DEST"
 mkdir -p "$DEST"
-for item in app scripts config.json requirements.txt assets README.md; do
+for item in app scripts companion config.json requirements.txt assets README.md; do
     [[ -e "$SRC/$item" ]] && cp -R "$SRC/$item" "$DEST"/
 done
 ok "copied source"
@@ -89,7 +89,7 @@ for _ in $(seq 1 30); do
     curl -fsS http://localhost:11434/api/version >/dev/null 2>&1 && break; sleep 1
 done
 ok "Ollama running"
-step "Downloading cleanup model ($LLM_MODEL, ~5 GB) — grab a coffee"
+step "Downloading cleanup model ($LLM_MODEL, ~8 GB) — grab a coffee"
 ollama pull "$LLM_MODEL" || warn "Model pull failed; cleanup will fall back to rules until you run: ollama pull $LLM_MODEL"
 
 step "Downloading speech model (large-v3-turbo, GPU) so the first dictation is instant"
@@ -115,6 +115,19 @@ rm -rf "$APPDIR/WhisperFlow.app"
 cp -R "$DEST/WhisperFlow.app" "$APPDIR/WhisperFlow.app"
 ok "installed to $APPDIR/WhisperFlow.app"
 
+# MarvinBar — the native menu-bar face + kill switch. macOS 26 hides status
+# items owned by the Python process, so this Swift companion owns it instead.
+# Needs swiftc (Xcode Command Line Tools); non-fatal if absent.
+step "Building MarvinBar (menu-bar face + kill switch)"
+if command -v swiftc >/dev/null 2>&1; then
+    bash "$DEST/scripts/build_marvinbar.sh" >/dev/null 2>&1 \
+        && ok "installed to $APPDIR/MarvinBar.app" \
+        || warn "MarvinBar build failed — Marvin still works, but you lose the menu-bar icon."
+else
+    warn "swiftc not found — skipping MarvinBar (no menu-bar icon)."
+    warn "Install it later with: xcode-select --install && bash $DEST/scripts/build_marvinbar.sh"
+fi
+
 step "Adding to Login Items (starts automatically each login)"
 osascript -e "tell application \"System Events\" to make login item at end with properties {path:\"$APPDIR/WhisperFlow.app\", hidden:false}" >/dev/null 2>&1 \
     && ok "added to Login Items" || warn "couldn't add Login Item automatically (you can add it in System Settings → General → Login Items)"
@@ -137,7 +150,7 @@ WhisperFlow needs two permissions. macOS shows it as ${BOLD}"$PYVER"${RESET}
          $PY )
   2. System Settings → Privacy & Security → ${BOLD}Input Monitoring${RESET}
        → turn ON ${BOLD}$PYVER${RESET} (same path if you need to add it)
-  3. Click the menu-bar Flow icon → Quit, then reopen WhisperFlow from Applications.
+  3. Click the menu-bar Marvin icon → Quit, then reopen WhisperFlow from Applications.
 
 Then: click into any text field, ${BOLD}hold Control+Shift+Space, speak, release${RESET}.
 Allow the Microphone prompt the first time. Works in Swedish and English.

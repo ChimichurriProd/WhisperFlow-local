@@ -59,7 +59,7 @@
     "engine": "auto",
     "language": "en",
     "chatterbox_model": "theoracleguy/Chatterbox-Multilingual-MLX-v2-fp16",
-    "voice_ref": "/Users/skonheten/Documents/WISPER_FLOW/assets/marvin/voice_ref.wav",
+    "voice_ref": "~/Library/WhisperFlow/assets/marvin/voice_ref.wav",
     "exaggeration": 0.3,
     "pitch": 1.35
   },
