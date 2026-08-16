@@ -85,6 +85,11 @@ class Delegate: NSObject, NSApplicationDelegate {
             dim.lockFocus()
             img.draw(in: NSRect(origin: .zero, size: img.size),
                      from: .zero, operation: .sourceOver, fraction: 0.3)
+            // Red badge: "engine NOT running" must be legible at a glance —
+            // a slightly paler face alone is easy to miss.
+            NSColor.systemRed.setFill()
+            NSBezierPath(ovalIn: NSRect(x: img.size.width - 8, y: 0,
+                                        width: 7, height: 7)).fill()
             dim.unlockFocus()
             deadIcon = dim
         } else {
@@ -95,6 +100,7 @@ class Delegate: NSObject, NSApplicationDelegate {
         statusLine.isEnabled = false
         menu.addItem(statusLine)
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(makeItem("Show Marvin — where is he?", #selector(showMarvin)))
         menu.addItem(makeItem("Start / Restart WhisperFlow", #selector(restartEngine)))
         menu.addItem(makeItem("Force Quit WhisperFlow", #selector(forceQuitEngine)))
         menu.addItem(NSMenuItem.separator())
@@ -123,6 +129,18 @@ class Delegate: NSObject, NSApplicationDelegate {
             item.button?.image = deadIcon
             item.button?.toolTip = "WhisperFlow is NOT running — click to restart"
             maybeRevive()
+        }
+    }
+
+    // "Where did he go?": SIGUSR1 asks the engine to rescue the pill onto a
+    // visible screen and bounce it (menubar._on_reveal_signal). If the engine
+    // is dead, just start it — Marvin appearing IS the answer.
+    @objc func showMarvin() {
+        if let pid = enginePid() {
+            run("/bin/kill", ["-USR1", pid])
+        } else {
+            manualStop = false
+            run("/usr/bin/open", [appPath])
         }
     }
 

@@ -34,7 +34,10 @@ mkdir -p "$LOG_DIR"
 cat > "$MACOS/WhisperFlow" <<EOF
 #!/bin/bash
 cd "$ROOT"
-exec "$PYTHON" -u -m app --menubar >> "$LOG_DIR/app.log" 2>&1
+# Rotate the log at 5 MB (one .old generation) — it appends forever otherwise.
+LOG="$LOG_DIR/app.log"
+[ -f "\$LOG" ] && [ "\$(stat -f%z "\$LOG")" -gt 5242880 ] && mv "\$LOG" "\$LOG.old"
+exec "$PYTHON" -u -m app --menubar >> "\$LOG" 2>&1
 EOF
 chmod +x "$MACOS/WhisperFlow"
 

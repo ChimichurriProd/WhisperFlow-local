@@ -123,6 +123,18 @@ def main(argv=None):
         return 0
     main._lock = lock  # keep the fd alive for the process lifetime
 
+    # Which code is this, actually? The source repo and the runtime copy
+    # (~/Library/WhisperFlow) have drifted apart before and cost whole days;
+    # sync_runtime.sh writes the stamp, we put it at the top of every log.
+    root = Path(__file__).resolve().parent.parent
+    stamp = root / "build_stamp.txt"
+    try:
+        build = stamp.read_text(encoding="utf-8").strip()
+    except OSError:
+        build = "(no stamp — running straight from a source checkout?)"
+    print(f"[app] code root: {root}", flush=True)
+    print(f"[app] build: {build}", flush=True)
+
     config_path = args.config
     if config_path is None:
         # CWD first, then the project root (matters under launchd).

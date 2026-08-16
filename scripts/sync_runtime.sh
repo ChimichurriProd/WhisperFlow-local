@@ -31,5 +31,12 @@ rsync -au "$SRC/assets/" "$DST/assets/"
 # Stale bytecode from the old code must not shadow the sync.
 find "$DST/app" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
 
+# Build stamp: the app logs this at startup, so every debugging session
+# starts with WHICH code is actually running instead of a guess (the
+# source-vs-runtime split has burned whole days before).
+GIT_DESC="$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo no-git)"
+[[ -z "$(git -C "$SRC" status --porcelain -uno 2>/dev/null)" ]] || GIT_DESC="$GIT_DESC+dirty"
+echo "synced $(date '+%Y-%m-%d %H:%M:%S') from $GIT_DESC" > "$DST/build_stamp.txt"
+
 echo "synced $SRC -> $DST"
 echo "restart the app to pick it up (MarvinBar menu, or relaunch WhisperFlow.app)"

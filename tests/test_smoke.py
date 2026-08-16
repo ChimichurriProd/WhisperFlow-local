@@ -1732,3 +1732,71 @@ def test_ask_start_signal_fires_for_ask_only():
         eng._active = False               # let another recording start
         eng._start_recording("dictate")
         assert fired == ["ask"]           # dictation must NOT fire the turn
+
+
+def test_dictation_can_start_while_previous_take_transcribes():
+    """The double-press bug: the old busy lock silently swallowed a press
+    while the previous take was still transcribing — you spoke into a mic
+    that wasn't recording. The mic must free up the moment a take ends, with
+    the heavy work queued FIFO behind whatever is still running."""
+    import threading as _th
+    import time as _t
+
+    import numpy as np
+
+    from app.config import load_config as _lc
+    from app.hotkey import PushToTalkApp
+
+    eng = PushToTalkApp(_lc())
+    gate = _th.Event()
+    jobs, starts = [], []
+
+    def slow_transcribe(audio):
+        jobs.append("start")
+        gate.wait(5.0)
+        return ""  # nothing recognized -> no injection path
+
+    eng.transcriber.transcribe = slow_transcribe
+    eng.recorder.start = lambda: starts.append(1)
+    eng.recorder.stop = lambda: np.ones(1600, dtype=np.float32)
+
+    with patch("app.hotkey.play_start"):
+        eng._start_recording("dictate")
+        eng._stop_recording("take 1")
+        for _ in range(100):               # wait for the worker to pick it up
+            if jobs:
+                break
+            _t.sleep(0.01)
+        assert jobs == ["start"], "pipeline never started take 1"
+
+        eng._start_recording("dictate")    # pressed again mid-transcription
+        assert eng._active, "second press was swallowed while busy"
+        assert len(starts) == 2, "the mic did not start for the second take"
+        eng._stop_recording("take 2")
+
+    gate.set()
+    for _ in range(200):                   # both jobs must drain, in order
+        if len(jobs) == 2 and not eng._pipeline_busy and eng._jobs.empty():
+            break
+        _t.sleep(0.01)
+    assert len(jobs) == 2, "queued take 2 was never processed"
+
+
+def test_release_signals_thinking_immediately():
+    """The 'is Marvin even working?' fix: the status must flip to
+    transcribing the instant the key lifts, not once the worker gets there."""
+    import numpy as np
+
+    from app.config import load_config as _lc
+    from app.hotkey import PushToTalkApp
+
+    states = []
+    eng = PushToTalkApp(_lc(), on_status=states.append)
+    eng.transcriber.transcribe = lambda audio: ""
+    eng.recorder.start = lambda: None
+    eng.recorder.stop = lambda: np.zeros(0, dtype=np.float32)
+
+    with patch("app.hotkey.play_start"):
+        eng._start_recording("dictate")
+        eng._stop_recording("test")
+    assert states[-1] == "transcribing", states

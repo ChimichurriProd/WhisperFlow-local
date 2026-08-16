@@ -11,6 +11,7 @@ A watchdog force-stops recording if the release event is missed (macOS can
 disable the event tap under load) or a recording runs past a hard cap.
 """
 
+import queue
 import sys
 import threading
 import time
@@ -152,7 +153,19 @@ class PushToTalkApp:
         self.transcriber = Transcriber(
             **config["stt"], initial_prompt=self._initial_prompt
         )
-        self._busy = threading.Lock()
+        # One pipeline worker drains finished recordings FIFO (STT -> cleanup
+        # or answer -> inject). Recording is DECOUPLED from it: the mic is free
+        # the moment _stop_recording snapshots the audio, so a new dictation
+        # can start while the previous one is still transcribing. (The old
+        # design held a busy lock through the whole pipeline and silently
+        # swallowed the next press — you spoke into a mic that wasn't
+        # recording.)
+        self._jobs = queue.Queue()
+        self._pipeline_busy = False
+        # Serializes recorder.start()/stop() across the event-tap, listener,
+        # watchdog and wake threads, so a lightning-fast tap can't interleave
+        # them (a start() after its own stop() would capture forever).
+        self._mic_lock = threading.Lock()
         self._pressed = set()  # currently-held keys, maintained by the listener
         self._on_status = on_status  # callable(state: str), e.g. menu-bar icon
         self._active = False           # currently recording
@@ -174,7 +187,7 @@ class PushToTalkApp:
         self._active_trigger_vk = None
         self._active_rmod_flag = None
         # Second hotkey: "ask Marvin". Same recorder + STT, different last stage
-        # (LLM answer + speak) — see on_release. Always a modifier+trigger combo
+        # (LLM answer + speak) — see _process. Always a modifier+trigger combo
         # (no right-modifier support), so one keycode covers intercept + watchdog.
         self._ask_required = frozenset()
         self._ask_modifiers = frozenset()
@@ -210,6 +223,8 @@ class PushToTalkApp:
         self.warming = False
         self._warm_thread = None
         threading.Thread(target=self._watchdog, daemon=True).start()
+        threading.Thread(target=self._pipeline, daemon=True,
+                         name="pipeline").start()
 
     def prewarm(self):
         """Load every lazy model in the background so the FIRST dictation and
@@ -382,13 +397,13 @@ class PushToTalkApp:
         if self._paused:
             return
         # Barge-in: if he's mid-answer, cut him off and take the new question.
-        # This has to happen before the _busy check — during playback the ask
-        # pipeline may still hold that lock.
+        # This has to happen before the pipeline-busy check — during playback
+        # the ask pipeline may still be running.
         if self.stop_speaking():
             print("[wake] interrupted mid-answer", flush=True)
             # Give playback a moment to die so its tail isn't recorded.
             time.sleep(0.15)
-        if self._active or self._busy.locked():
+        if self._active or self._pipeline_busy or not self._jobs.empty():
             return
         if not self._ask_on:
             print("[wake] heard, but Ask Marvin is switched off", flush=True)
@@ -573,12 +588,25 @@ class PushToTalkApp:
             if not self._active:
                 return
             self._active = False
+            self._hands_free = False
             kind = self._active_kind
         if reason:
             print(f"[rec] stop ({reason})", flush=True)
-        threading.Thread(
-            target=self.on_release, args=(kind,), daemon=True
-        ).start()
+        # Snapshot the audio NOW — recorder.stop() only flips a flag and
+        # concatenates buffers, so the mic is immediately free for the next
+        # press. The heavy stages run on the pipeline worker, FIFO behind
+        # whatever is still finishing.
+        with self._mic_lock:
+            try:
+                audio = self.recorder.stop()
+            except Exception as exc:
+                print(f"[rec] recorder stop failed: {exc!r}", flush=True)
+                audio = None
+        self._jobs.put((kind, audio))
+        # Thinking-face feedback the instant the key lifts (unless the user
+        # already started the next take — then "recording" owns the display).
+        if not self._active:
+            self._status("transcribing")
 
     def _watchdog(self):
         """Safety net, twice over:
@@ -658,17 +686,16 @@ class PushToTalkApp:
             time.sleep(0.02)
 
     def on_press(self):
-        if self._busy.locked():
-            # A previous transcription is still finishing; ignore this press
-            # (don't leave _active set, or the watchdog would spin on it).
-            self._active = False
-            self.set_wake_suppressed(False)  # on_release won't run to undo it
-            return
         print("[rec] listening...", flush=True)
         self._status("recording")
         play_start(self.config)
         try:
-            self.recorder.start()
+            with self._mic_lock:
+                # A lightning-fast tap can already be over (its stop() ran and
+                # captured nothing) — don't reopen the mic for a dead take, or
+                # it would capture forever with no stop() ever coming.
+                if self._active:
+                    self.recorder.start()
         except Exception as exc:
             # Mic unavailable / permission denied: recover to idle instead of
             # letting the exception break the listener callback.
@@ -677,55 +704,67 @@ class PushToTalkApp:
             self.set_wake_suppressed(False)
             self._status("idle")
 
-    def on_release(self, kind="dictate"):
-        with self._busy:
+    def _pipeline(self):
+        """Worker draining finished recordings FIFO, one at a time."""
+        while True:
+            kind, audio = self._jobs.get()
+            self._pipeline_busy = True
             try:
-                audio = self.recorder.stop()
+                self._process(kind, audio)
             except Exception as exc:
-                # A failed mic teardown must never wedge the busy lock (that
-                # would leave the app stuck in "record" for good).
-                print(f"[rec] recorder stop failed: {exc!r}", flush=True)
-                audio = None
-            # "transcribing" doubles as the busy/thinking indicator for both
-            # pipelines (STT, and for ask, the LLM answer too).
-            self._status("transcribing")
-            try:
-                if audio is None or len(audio) == 0:
-                    print("[rec] no audio captured", flush=True)
-                    return
-                seconds = len(audio) / self.config["audio"]["sample_rate"]
-                print(f"[rec] captured {seconds:.1f}s, transcribing...", flush=True)
-                raw = self.transcriber.transcribe(audio)
-                if not raw:
-                    print("[stt] (nothing recognized)", flush=True)
-                    return
-                if kind == "ask":
-                    # Same hallucination guard as dictation: don't send a
-                    # Whisper repetition loop to the LLM as a "question".
-                    question = collapse_repeats(raw)
-                    if not question:
-                        print("[stt] (hallucination filtered, ask dropped)",
-                              flush=True)
-                        return
-                    self._handle_ask(question)
-                    return
-                cleaned = clean_transcript(raw, self.config)
-                if not cleaned:
-                    print("[out] (empty after cleanup, nothing to inject)", flush=True)
-                    return
-                print(f'[out] injecting into focused app: "{cleaned}"', flush=True)
-                self._wait_hotkey_released()
-                to_inject = cleaned
-                if self.config["injection"].get("append_trailing_space", True):
-                    to_inject += " "  # keep a gap before the next dictation
-                inject_text(to_inject, self.config)
-                play_done(self.config)
+                print(f"[rec] pipeline job failed: {exc!r}", flush=True)
             finally:
-                self._hands_free = False
-                # Listen again — after a beat, so the tail of the user's own
-                # question can't be heard as a fresh "Hey Marvin".
-                self.set_wake_suppressed(False)
-                self._status("idle")
+                self._pipeline_busy = False
+                if not self._active:
+                    # Listen again — the processing time is the natural beat
+                    # that keeps the tail of the user's own speech from being
+                    # heard as a fresh "Hey Marvin". A newer recording owns
+                    # the suppression, so leave it alone then.
+                    self.set_wake_suppressed(False)
+                    if self._jobs.empty():
+                        self._status("idle")
+
+    def _process(self, kind, audio):
+        # "transcribing" doubles as the busy/thinking indicator for both
+        # pipelines (STT, and for ask, the LLM answer too) — but never
+        # overwrite "recording" while a newer take is being spoken.
+        if not self._active:
+            self._status("transcribing")
+        if audio is None or len(audio) == 0:
+            print("[rec] no audio captured", flush=True)
+            return
+        seconds = len(audio) / self.config["audio"]["sample_rate"]
+        print(f"[rec] captured {seconds:.1f}s, transcribing...", flush=True)
+        raw = self.transcriber.transcribe(audio)
+        if not raw:
+            print("[stt] (nothing recognized)", flush=True)
+            return
+        if kind == "ask":
+            # Same hallucination guard as dictation: don't send a
+            # Whisper repetition loop to the LLM as a "question".
+            question = collapse_repeats(raw)
+            if not question:
+                print("[stt] (hallucination filtered, ask dropped)",
+                      flush=True)
+                return
+            self._handle_ask(question)
+            return
+        cleaned = clean_transcript(raw, self.config)
+        if not cleaned:
+            print("[out] (empty after cleanup, nothing to inject)", flush=True)
+            return
+        print(f'[out] injecting into focused app: "{cleaned}"', flush=True)
+        while self._active:
+            # A newer take is being dictated: injecting now would synthesize
+            # Cmd+V with the hotkey's modifiers held down. Wait it out — the
+            # watchdog caps every recording, so this always ends.
+            time.sleep(0.1)
+        self._wait_hotkey_released()
+        to_inject = cleaned
+        if self.config["injection"].get("append_trailing_space", True):
+            to_inject += " "  # keep a gap before the next dictation
+        inject_text(to_inject, self.config)
+        play_done(self.config)
 
     def _warm_ask_model(self):
         """Best-effort preload of the answer model (called at ask-record start)."""

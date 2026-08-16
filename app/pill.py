@@ -49,6 +49,10 @@ _TURN_SPEED = 4.0      # spin frames advanced per 20 Hz tick (~0.75 s per turn)
 _BACK_EYES = ((0.360, 0.525), (0.638, 0.525))
 _BACK_EYE_RGB = (0.37, 0.88, 1.0)   # cyan bloom for the oracle's voice glow
 
+# "Show Marvin" attention bounce: how many 20 Hz ticks the whole window hops
+# for after reveal() — long enough that the eye finds him wherever he is.
+_ATTN_TICKS = 44
+
 
 def _ease_toward(cur, target, speed):
     """Step *cur* toward *target* by at most *speed* (never overshoots). Used to
@@ -335,6 +339,12 @@ try:
                 self._c.on_menu(self, event)
 
         def mouseDown_(self, event):
+            # Grabbing him cancels the attention bounce — and lands him back
+            # on base first, so the drag math starts from the real position.
+            if getattr(self._c, "_attn", 0) > 0:
+                self._c._attn = 0
+                if self._c._attn_base is not None:
+                    self.window().setFrameOrigin_(self._c._attn_base)
             # Control-click = right-click: open the menu instead of dragging.
             if (event.modifierFlags() & NSEventModifierFlagControl) and self._c.on_menu:
                 self._c.on_menu(self, event)
@@ -392,6 +402,16 @@ try:
         # -------- drawing --------------------------------------------------
 
         def drawRect_(self, rect):
+            # An exception escaping drawRect_ takes the whole app down via
+            # AppKit's _crashOnException, and this view redraws 20x/s — one
+            # bad frame must cost a blink, never the dictation app.
+            try:
+                self._draw()
+            except Exception as exc:
+                print(f"[pill] draw failed: {exc!r}", flush=True)
+
+        @objc.python_method
+        def _draw(self):
             c = self._c
             w = self.frame().size.width
             h = self.frame().size.height
@@ -650,6 +670,9 @@ try:
                 r = radius * 0.85 * s * (1.0 + 0.28 * z)
                 if c.mode == "recording" and c.levels:
                     r *= 1.0 + 0.25 * max(0.0, min(1.0, c.levels[-1]))
+                elif c.mode == "transcribing":
+                    # bigger + pulsing while he works, matching the racing orbit
+                    r *= 1.15 + 0.15 * math.sin(c._anim * 8.0)
                 r *= 1.0 + 0.8 * c._orb_pop
                 if r > 0.3:
                     self._orb_dot(x, y, r, color, a)
@@ -981,6 +1004,10 @@ try:
             self._idle_gesture_t = random.randint(300, 700)
             self._demo_queue = []      # remaining clips in a "play all" showcase
             self._showcase = None      # the "all animations" grid window
+            # "Show Marvin" attention bounce (reveal()): remaining ticks and
+            # the window origin to land back on.
+            self._attn = 0
+            self._attn_base = None
             _marv = style == "marvin"
             self._h = _MARVIN_SIZE if _marv else _HEIGHT
             self._w = _MARVIN_SIZE if _marv else _WIDTH_IDLE
@@ -1122,6 +1149,46 @@ try:
             self._resize(self._target_width())
             self.view.setNeedsDisplay_(True)
 
+        def reveal(self):
+            """Menu-bar "Show Marvin — where is he?": make sure the window
+            actually sits on a screen (rescue it if it was dragged off the
+            edge or left on a display that's gone), raise it, and bounce it
+            for a couple of seconds so the eye finds him even in a corner."""
+            f = self.window.frame()
+            cx = f.origin.x + f.size.width / 2.0
+            cy = f.origin.y + f.size.height / 2.0
+            on_screen = False
+            for s in NSScreen.screens():
+                vf = s.visibleFrame()
+                # The head sits at the window centre (the rest is transparent
+                # margin), so "visible" means the CENTRE is well inside a
+                # screen — a corner of empty margin peeking in doesn't count.
+                if (vf.origin.x + 40 <= cx <= vf.origin.x + vf.size.width - 40
+                        and vf.origin.y + 40 <= cy
+                        <= vf.origin.y + vf.size.height - 40):
+                    on_screen = True
+                    break
+            if not on_screen:
+                screen = _screen_with_mouse().frame()
+                x = screen.origin.x + (screen.size.width - self._w) / 2.0
+                y = screen.origin.y + screen.size.height - self._h - 64.0
+                self.window.setFrameOrigin_((x, y))
+                if self.on_move:
+                    try:  # persist the rescue position like a manual drag
+                        self.on_move(float(x), float(y))
+                    except Exception:
+                        pass
+            self.window.orderFrontRegardless()
+            o = self.window.frame().origin
+            self._attn_base = (float(o.x), float(o.y))
+            self._attn = _ATTN_TICKS
+            self._orb_pop = 1.0    # flare the firefly too
+            for name in ("alert", "wake", "doubletake", "glance"):
+                if name in self.clips:
+                    self.play_oneshot(name)
+                    break
+            self._render()
+
         def show_showcase(self):
             """Open (or focus) the grid window with every clip animating."""
             if self.style != "marvin" or not self.clips:
@@ -1135,6 +1202,19 @@ try:
             self.mode = mode
             if self._showcase is not None and not self._showcase.tick():
                 self._showcase = None
+            # "Show Marvin" attention bounce: hop the whole window with a
+            # decaying amplitude, then land exactly back on the base origin.
+            if self._attn > 0 and self._attn_base is not None:
+                self._attn -= 1
+                bx, by = self._attn_base
+                if self._attn <= 0:
+                    self.window.setFrameOrigin_((bx, by))
+                else:
+                    k = self._attn / float(_ATTN_TICKS)       # 1 -> 0
+                    prog = 1.0 - k
+                    dy = abs(math.sin(prog * math.pi * 4.0)) * 34.0 * k
+                    dx = math.sin(prog * math.pi * 8.0) * 6.0 * k
+                    self.window.setFrameOrigin_((bx + dx, by + dy))
             # Decay the model-switch flare (~0.6 s). Runs before the oracle
             # early-return so a switch can't leave it stuck.
             if self._orb_pop > 0.0:
@@ -1250,6 +1330,10 @@ try:
                 # hurries, loiters, hurries — never a metronome. Always > 0.
                 sp = 0.032 * (1.0 + 0.45 * math.sin(t * 0.53 + 1.7)
                               + 0.25 * math.sin(t * 1.31))
+                if mode == "transcribing":
+                    # The firefly RACES while Marvin works — the unmistakable
+                    # "he heard you, he's on it" cue after a dictation ends.
+                    sp *= 5.0
                 self._orb_theta = (self._orb_theta + sp) % (2.0 * math.pi)
                 x, y, z = _orb_orbit(t, self._orb_theta, self._w)
                 self._orb_pos = (x, y, z, 1.0)

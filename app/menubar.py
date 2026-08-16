@@ -124,9 +124,25 @@ class MenuBarApp(rumps.App):
         self.demo_item = rumps.MenuItem(
             "Play all animations", callback=self._play_all_anims
         )
-        self.menu = [self.status_item, self.model_menu, self.settings_menu,
+        self.show_item = rumps.MenuItem(
+            "Show Marvin", callback=lambda _s: self._reveal_marvin()
+        )
+        self.menu = [self.status_item, self.show_item, self.model_menu,
+                     self.settings_menu,
                      self.perms_item, self.pause_item, self.demo_item, None,
                      rumps.MenuItem("Quit", callback=rumps.quit_application)]
+
+        # "Show Marvin — where is he?": MarvinBar (the native companion, the
+        # only menu-bar item VISIBLE on macOS 26) sends SIGUSR1 when its item
+        # is clicked. The handler only sets a flag; the main-thread pill timer
+        # performs the actual reveal (AppKit is main-thread-only, and Python
+        # runs signal handlers whenever the timer next executes bytecode).
+        self._reveal_requested = False
+        import signal
+        try:
+            signal.signal(signal.SIGUSR1, self._on_reveal_signal)
+        except ValueError:
+            pass  # not on the main thread (embedded run): menu item still works
 
         # Ask-Marvin: the engine hands answers back via _present_answer, which
         # marshals them to the main-thread pill timer (AppKit is main-only).
@@ -204,10 +220,25 @@ class MenuBarApp(rumps.App):
         if not trusted:
             self.set_state("blocked")
 
+    def _on_reveal_signal(self, _sig, _frame):
+        self._reveal_requested = True
+
+    def _reveal_marvin(self):
+        """Rescue the pill onto a visible screen and bounce it (menu item, and
+        MarvinBar's "Show Marvin" via SIGUSR1)."""
+        if self.pill is not None and hasattr(self.pill, "reveal"):
+            self.pill.reveal()
+
     def _drive_pill(self, _timer):
         # Runs on the main thread (rumps timer): the only safe place to touch
         # AppKit. Sync the menu-bar title here from the thread-safe _mode flag
         # instead of from worker threads.
+        if self._reveal_requested:
+            self._reveal_requested = False
+            try:
+                self._reveal_marvin()
+            except Exception as exc:
+                print(f"[pill] reveal failed: {exc!r}", flush=True)
 
         # A worker thread may have parked an answer for us to present (creating
         # the bubble / speaking must happen on the main thread).
@@ -284,6 +315,7 @@ class MenuBarApp(rumps.App):
         if (pill_mode == "idle" and self.pill.style != "marvin"
                 and not self._warming_shown
                 and not self.pill.hover
+                and not getattr(self.pill, "_attn", 0)  # reveal bounce running
                 and not any(v > 0.001 for v in self.pill.levels)):
             return
         self.pill.tick(pill_mode, level)
