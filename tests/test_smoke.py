@@ -1991,3 +1991,11 @@ def test_silent_builtin_with_lid_closed_switches_mic(config, monkeypatch):
     app.set_input_device = switch
     app._process("dictate", np.zeros(16000, dtype=np.float32))
     assert len(notices) == 1 and "USB Mic" in notices[0]
+
+
+def test_menu_shows_shortcuts_as_mac_glyphs():
+    pytest.importorskip("AppKit")
+    from app.menubar import _pretty_combo
+
+    assert _pretty_combo("control + shift + a") == "⌃⇧A"
+    assert _pretty_combo("option + space") == "⌥Space"

@@ -78,6 +78,38 @@ MODEL_CHOICES = [
 ]
 
 
+# Header word per pill mode in the right-click menu.
+_MODE_WORDS = {"idle": "ready", "recording": "listening",
+               "transcribing": "thinking", "paused": "paused",
+               "blocked": "needs permission"}
+
+_COMBO_GLYPHS = {"control": "⌃", "ctrl": "⌃", "shift": "⇧", "option": "⌥",
+                 "alt": "⌥", "command": "⌘", "cmd": "⌘", "space": "Space"}
+
+
+def _pretty_combo(binding):
+    """'control + shift + a' -> '⌃⇧A' (how macOS menus show shortcuts)."""
+    parts = [p.strip().lower() for p in str(binding).split("+")]
+    return "".join(_COMBO_GLYPHS.get(p, p.upper()) for p in parts)
+
+
+def _set_symbol(item, name):
+    """Give a menu item an SF Symbol icon (macOS 11+). Template images, so
+    they follow light/dark mode like Finder's. Older macOS: no icon."""
+    if not name:
+        return
+    try:
+        from AppKit import NSImage
+
+        img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            name, None)
+    except Exception:
+        return
+    if img is not None:
+        img.setTemplate_(True)
+        item.setImage_(img)
+
+
 class MenuBarApp(rumps.App):
     def __init__(self, config, config_path=None):
         # Marvin's face in the menu bar = "the app is alive". Falls back to
@@ -351,9 +383,9 @@ class MenuBarApp(rumps.App):
     # Which KB-Whisper (Swedish-specialist STT) handles Swedish, if any. With
     # the language on auto-detect this is a second decode on Swedish
     # utterances only — see stt.Transcriber._transcribe_mlx.
-    _SWEDISH_MODELS = [("KB-Whisper large — best Swedish", "kb-large"),
-                       ("KB-Whisper small — quicker", "kb-small"),
-                       ("Off — one model for every language", None)]
+    _SWEDISH_MODELS = [("KB-Whisper large (best Swedish)", "kb-large"),
+                       ("KB-Whisper small (quicker)", "kb-small"),
+                       ("Off (one model for every language)", None)]
 
     # Marvin's spoken/answer language ("tts.language"): forces BOTH the Ollama
     # answer language (answer.py appends a hard override — small models drift
@@ -772,14 +804,18 @@ class MenuBarApp(rumps.App):
     # ------------------------------------------------- pill right-click menu
 
     def show_pill_menu(self, view, event):
-        """Build and pop up a native menu at the pill (right/control-click)."""
+        """Build and pop up a native menu at the pill (right/control-click).
+
+        Everyday actions sit at the top with SF Symbol icons; everything most
+        people never touch (model, hotkey, vocabulary, sounds, animations)
+        lives under "More settings"."""
         if self.pill is not None:
             self.pill.play_oneshot("react")  # a little reaction (if present)
         menu = NSMenu.alloc().init()
         menu.setAutoenablesItems_(False)
         self._menu_callbacks = []
 
-        def add(title, cb, parent, state=0, enabled=True):
+        def add(title, cb, parent, state=0, enabled=True, icon=None):
             item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 title, "fire:", ""
             )
@@ -787,129 +823,146 @@ class MenuBarApp(rumps.App):
             item.setTag_(len(self._menu_callbacks))
             item.setState_(1 if state else 0)
             item.setEnabled_(enabled)
+            _set_symbol(item, icon)
             self._menu_callbacks.append(cb)
             parent.addItem_(item)
+            return item
 
-        def submenu(title, parent=menu):
+        def info(title, parent, icon=None):
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, None, "")
+            item.setEnabled_(False)
+            _set_symbol(item, icon)
+            parent.addItem_(item)
+
+        def submenu(title, parent=menu, icon=None):
             parent_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 title, None, ""
             )
+            _set_symbol(parent_item, icon)
             sub = NSMenu.alloc().init()
             sub.setAutoenablesItems_(False)
             parent_item.setSubmenu_(sub)
             parent.addItem_(parent_item)
             return sub
 
-        header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "WhisperFlow", None, ""
-        )
-        header.setEnabled_(False)
-        menu.addItem_(header)
-        menu.addItem_(NSMenuItem.separatorItem())
+        def sep(parent=menu):
+            parent.addItem_(NSMenuItem.separatorItem())
 
-        cur_model = self.config["stt"]["model"]
-        model_sub = submenu("Model")
-        for val, label in MODEL_CHOICES:
-            add(label, (lambda v=val: self.select_model(v)), model_sub,
-                state=(val == cur_model))
+        # ---- status: what Marvin is doing and what he listens with
+        mode = "paused" if self._paused else self._mode
+        info(f"Marvin  ·  {_MODE_WORDS.get(mode, 'ready')}", menu)
+        mic = self.engine.recorder.device_name or "Microphone not open yet"
+        lang = dict((c, l) for l, c in self._LANGUAGES).get(
+            self.config["stt"].get("language"), "Auto-detect")
+        info(f"{mic}  ·  {lang}", menu, icon="mic")
+        sep()
+
+        # ---- everyday actions
+        ask_binding = self.config.get("hotkey", {}).get("ask", "control + shift + a")
+        add(f"Ask Marvin…  ({_pretty_combo(ask_binding)})",
+            lambda: self._ask_prompt(), menu, icon="bubble.left.and.bubble.right")
+        add("Transcribe audio file…",
+            lambda: self._pick_files_to_transcribe(), menu, icon="waveform")
+        sep()
+
+        self._add_mic_menu(submenu("Microphone", icon="mic"), add)
 
         cur_lang = self.config["stt"].get("language")
-        lang_sub = submenu("Language")
+        lang_sub = submenu("Language", icon="globe")
         for label, code in self._LANGUAGES:
             add(label, (lambda c=code: self._apply_language(c)), lang_sub,
                 state=(code == cur_lang))
-        lang_sub.addItem_(NSMenuItem.separatorItem())
-        cur_sv = self.config["stt"].get("swedish_model")
-        for label, key in self._SWEDISH_MODELS:
-            add(label, (lambda k=key: self._apply_swedish_model(k)), lang_sub,
-                state=(key == cur_sv))
-
-        self._add_mic_menu(submenu("Microphone"), add)
 
         cur_style = self.config.get("ui", {}).get("pill_style", "waveform")
-        look_sub = submenu("Appearance")
+        look_sub = submenu("Appearance", icon="paintpalette")
         for val, label in (("marvin", "Marvin"), ("waveform", "Waveform")):
             add(label, (lambda v=val: self.set_pill_style(v)), look_sub,
                 state=(val == cur_style))
         if cur_style == "marvin":
-            look_sub.addItem_(NSMenuItem.separatorItem())
+            sep(look_sub)
             cur_skin = self.config.get("ui", {}).get("marvin_skin", "B")
-            for key, label in (("B", "Skin: B — Stoned"),
-                               ("A", "Skin: A — Clean"),
-                               ("G", "Skin: G — Plush")):
+            for key, label in (("B", "Stoned"), ("A", "Clean"), ("G", "Plush")):
                 add(label, (lambda k=key: self._apply_skin(k)), look_sub,
                     state=(key == cur_skin))
+        sep()
 
-        # Preview animations: one-shot on the pill, or the whole set at once
-        # in the showcase grid window.
-        if self.pill is not None and getattr(self.pill, "clips", None):
-            anim_sub = submenu("Animate")
-            add("Play all on Marvin", lambda: self.pill.play_all(), anim_sub)
-            add("All at once (window)…",
-                lambda: self.pill.show_showcase(), anim_sub)
-            for cname in sorted(self.pill.clips):
-                add(cname.replace("_", " ").title(),
-                    (lambda n=cname: self.pill.play_oneshot(n)), anim_sub)
+        # ---- More settings: everything else, grouped
+        more = submenu("More settings", icon="gearshape")
 
-        menu.addItem_(NSMenuItem.separatorItem())
+        info("Dictation", more)
+        cur_model = self.config["stt"]["model"]
+        model_sub = submenu("Accuracy", more, icon="dial.medium")
+        for val, label in MODEL_CHOICES:
+            add(label, (lambda v=val: self.select_model(v)), model_sub,
+                state=(val == cur_model))
+        sep(model_sub)
+        info("Swedish specialist", model_sub)
+        cur_sv = self.config["stt"].get("swedish_model")
+        for label, key in self._SWEDISH_MODELS:
+            add(label, (lambda k=key: self._apply_swedish_model(k)), model_sub,
+                state=(key == cur_sv))
 
-        # Input mode: hold-to-talk vs tap-to-toggle
+        cleanup_on = self.config["cleanup"].get("enabled", True)
+        add("AI cleanup", lambda: self._apply_cleanup(not cleanup_on), more,
+            state=cleanup_on, icon="sparkles")
+
         toggle_on = self.config["hotkey"].get("mode", "hold") == "toggle"
-        in_sub = submenu("Input mode")
-        add("Hold to talk", lambda: self._apply_input_mode(False), in_sub,
-            state=not toggle_on)
-        add("Tap to toggle", lambda: self._apply_input_mode(True), in_sub,
-            state=toggle_on)
-
-        # Hotkey presets
         cur_hk = self.config["hotkey"].get("push_to_talk")
-        hk_sub = submenu("Hotkey")
+        hk_sub = submenu("Hotkey", more, icon="keyboard")
+        add("Hold to talk", lambda: self._apply_input_mode(False), hk_sub,
+            state=not toggle_on)
+        add("Tap to toggle", lambda: self._apply_input_mode(True), hk_sub,
+            state=toggle_on)
+        sep(hk_sub)
         for binding, label in self._HOTKEYS:
             add(label, (lambda b=binding: self._apply_hotkey(b)), hk_sub,
                 state=(binding == cur_hk))
 
-        # Vocabulary editor
         vocab = self.config.get("vocabulary", {})
-        voc_sub = submenu("Vocabulary")
-        add(f"{len(vocab.get('terms', []))} words, "
-            f"{len(vocab.get('fixes', {}))} fixes", lambda: None, voc_sub,
-            enabled=False)
+        voc_sub = submenu("Vocabulary", more, icon="character.book.closed")
+        info(f"{len(vocab.get('terms', []))} words, "
+             f"{len(vocab.get('fixes', {}))} fixes", voc_sub)
         add("Add word…", lambda: self._add_vocab_word(), voc_sub)
         add("Add correction…", lambda: self._add_vocab_fix(), voc_sub)
 
-        menu.addItem_(NSMenuItem.separatorItem())
-        talk_on = self.config.get("ui", {}).get("double_click_talk", True)
-        add("Double-click to talk", lambda: self._apply_talk(not talk_on), menu,
-            state=talk_on)
-        add("Say something", lambda: self._marvin_speak(force=True), menu)
-
-        # Ask Marvin (speak a question, he answers)
+        sep(more)
+        info("Marvin", more)
         ask_on = self.config.get("ask", {}).get("enabled", True)
         ask_voice = self.config.get("ask", {}).get("voice", True)
-        ask_binding = self.config.get("hotkey", {}).get("ask", "control + shift + a")
-        add(f"Ask Marvin  ({ask_binding})",
-            lambda: self._apply_ask_enabled(not ask_on), menu, state=ask_on)
-        add("Speak answers", lambda: self._apply_ask_voice(not ask_voice), menu,
-            state=ask_voice)
+        add("Questions hotkey", lambda: self._apply_ask_enabled(not ask_on),
+            more, state=ask_on, icon="questionmark.bubble")
+        add("Speak answers", lambda: self._apply_ask_voice(not ask_voice), more,
+            state=ask_voice, icon="speaker.wave.2")
         wake = self.config.get("wakeword", {})
         wake_on = wake.get("enabled", False)
         add(f'Hands-free  ("{wake.get("phrase", "Hey Marvin")}")',
-            lambda: self._apply_wakeword(not wake_on), menu, state=wake_on)
+            lambda: self._apply_wakeword(not wake_on), more, state=wake_on,
+            icon="ear")
         turns = len(getattr(self.engine, "_turns", [])) // 2
         add(f"New conversation  ({turns} turn{'' if turns == 1 else 's'} remembered)",
-            lambda: self.engine.reset_conversation(), menu,
-            enabled=turns > 0)
-        add("Ask Marvin…", lambda: self._ask_prompt(), menu)
-        add("Transkribera ljudfil…",
-            lambda: self._pick_files_to_transcribe(), menu)
+            lambda: self.engine.reset_conversation(), more,
+            enabled=turns > 0, icon="arrow.counterclockwise")
+        talk_on = self.config.get("ui", {}).get("double_click_talk", True)
+        add("Double-click to talk", lambda: self._apply_talk(not talk_on), more,
+            state=talk_on, icon="hand.tap")
+        add("Say something", lambda: self._marvin_speak(force=True), more,
+            icon="quote.bubble")
+        # Preview animations: one-shot on the pill, or the whole set at once
+        # in the showcase grid window.
+        if self.pill is not None and getattr(self.pill, "clips", None):
+            anim_sub = submenu("Animations", more, icon="film")
+            add("Play all on Marvin", lambda: self.pill.play_all(), anim_sub)
+            add("All at once (window)…",
+                lambda: self.pill.show_showcase(), anim_sub)
+            sep(anim_sub)
+            for cname in sorted(self.pill.clips):
+                add(cname.replace("_", " ").title(),
+                    (lambda n=cname: self.pill.play_oneshot(n)), anim_sub)
 
-        cleanup_on = self.config["cleanup"].get("enabled", True)
-        add("AI cleanup", lambda: self._apply_cleanup(not cleanup_on), menu,
-            state=cleanup_on)
-
-        # Sounds: on/off + pick start/done from the system sounds
+        sep(more)
         sc = self.config.get("sound_cues", {})
-        snd_sub = submenu("Sounds")
+        snd_sub = submenu("Sounds", more, icon="bell")
         add("Enabled", lambda: self._apply_sound(not sc.get("enabled", True)),
             snd_sub, state=sc.get("enabled", True))
         start_sub = submenu("Start sound", snd_sub)
@@ -920,10 +973,15 @@ class MenuBarApp(rumps.App):
             add(nm, (lambda n=nm: self._set_cue_sound("done", n)), done_sub,
                 state=(nm == sc.get("done", "Pop")))
 
-        menu.addItem_(NSMenuItem.separatorItem())
-        add("Resume listening" if self._paused else "Pause listening",
-            lambda: self.toggle_pause(self.pause_item), menu)
-        add("Quit WhisperFlow", lambda: rumps.quit_application(), menu)
+        # ---- pause / quit
+        if self._paused:
+            add("Resume listening", lambda: self.toggle_pause(self.pause_item),
+                menu, icon="play.circle")
+        else:
+            add("Pause listening", lambda: self.toggle_pause(self.pause_item),
+                menu, icon="pause.circle")
+        add("Quit WhisperFlow", lambda: rumps.quit_application(), menu,
+            icon="power")
 
         NSMenu.popUpContextMenu_withEvent_forView_(menu, event, view)
 
