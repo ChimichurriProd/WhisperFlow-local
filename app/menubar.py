@@ -8,6 +8,7 @@ primary UI; the menu-bar title is a compact text fallback.
 
 import json
 import os
+import threading
 from pathlib import Path
 
 import rumps
@@ -15,9 +16,11 @@ from AppKit import NSMenu, NSMenuItem
 from Foundation import NSObject
 import objc
 
-from .hotkey import PushToTalkApp
+from .hotkey import TRUST_NOTICE, PushToTalkApp
 from .permissions import is_trusted, prompt_for_trust
 from .pill import create_pill
+
+_SAVE_LOCK = threading.Lock()
 
 
 class _MenuTarget(NSObject):
@@ -160,7 +163,7 @@ class MenuBarApp(rumps.App):
         self._answering = False
         self.engine = PushToTalkApp(
             config, on_status=self.set_state, on_answer=self._present_answer,
-            on_ask_start=self._on_ask_start,
+            on_ask_start=self._on_ask_start, on_notice=self._park_notice,
         )
         self.listener = self.engine.build_listener()
         self.listener.start()
@@ -219,6 +222,7 @@ class MenuBarApp(rumps.App):
 
         if not trusted:
             self.set_state("blocked")
+            self._park_notice(TRUST_NOTICE)
 
     def _on_reveal_signal(self, _sig, _frame):
         self._reveal_requested = True
@@ -533,6 +537,11 @@ class MenuBarApp(rumps.App):
 
     # -------- Ask Marvin (Ctrl+Shift+A) ------------------------------------
 
+    def _park_notice(self, text):
+        """Engine callback (any thread): park a status message for the
+        main-thread pill timer, which shows it in a bubble by Marvin."""
+        self._pending_notice = text
+
     def _present_answer(self, question, answer):
         """Engine callback (worker thread): park the answer for the main-thread
         pill timer, which owns AppKit (bubble) and kicks off speech."""
@@ -815,6 +824,8 @@ class MenuBarApp(rumps.App):
             add(label, (lambda k=key: self._apply_swedish_model(k)), lang_sub,
                 state=(key == cur_sv))
 
+        self._add_mic_menu(submenu("Microphone"), add)
+
         cur_style = self.config.get("ui", {}).get("pill_style", "waveform")
         look_sub = submenu("Appearance")
         for val, label in (("marvin", "Marvin"), ("waveform", "Waveform")):
@@ -916,6 +927,55 @@ class MenuBarApp(rumps.App):
 
         NSMenu.popUpContextMenu_withEvent_forView_(menu, event, view)
 
+    # ----------------------------------------------------------- microphone
+
+    def _add_mic_menu(self, sub, add):
+        """Microphone submenu: the Mac's own mic (default), follow macOS, or
+        any connected input by name. Built fresh on every right-click."""
+        from .audio import BUILTIN, DEFAULT, input_devices
+
+        cur = self.config["audio"].get("input_device", BUILTIN)
+        in_use = self.engine.recorder.device_name
+        if in_use:
+            add(f"In use: {in_use}", lambda: None, sub, enabled=False)
+            sub.addItem_(NSMenuItem.separatorItem())
+        add("MacBook microphone (built-in)",
+            lambda: self._apply_mic(BUILTIN), sub, state=(cur == BUILTIN))
+        add("System default (follows macOS)",
+            lambda: self._apply_mic(DEFAULT), sub, state=(cur in (None, DEFAULT)))
+        sub.addItem_(NSMenuItem.separatorItem())
+        try:
+            names = [n for _i, n in input_devices()]
+        except Exception as exc:
+            print(f"[rec] could not list input devices: {exc!r}", flush=True)
+            names = []
+        for name in names:
+            add(name, (lambda n=name: self._apply_mic(n)), sub,
+                state=(cur == name))
+        sub.addItem_(NSMenuItem.separatorItem())
+        add("Rescan devices", lambda: self._apply_mic(cur), sub)
+
+    def _apply_mic(self, spec):
+        """Switch microphone off the main thread: closing and reopening the
+        CoreAudio stream can take a moment, and the menu must not stall."""
+        def _run():
+            try:
+                ok = self.engine.set_input_device(spec)
+            except Exception as exc:
+                print(f"[rec] switching microphone failed: {exc!r}", flush=True)
+                self._park_notice("Kunde inte byta mikrofon. Se loggen.")
+                return
+            if not ok:
+                self._park_notice("Släpp tangenten först, sedan kan jag byta "
+                                  "mikrofon.")
+                return
+            self._save_config()
+            name = self.engine.recorder.device_name
+            if name:
+                self._park_notice(f"Mikrofon: {name}")
+
+        threading.Thread(target=_run, name="mic-switch", daemon=True).start()
+
     # ---------------------------------------------------------------- model
 
     def _make_model_cb(self, value):
@@ -1005,6 +1065,12 @@ class MenuBarApp(rumps.App):
     def _save_config(self):
         if not self.config_path:
             return
+        # The Microphone menu saves from its worker thread; two writers on the
+        # same .tmp file could interleave into a corrupt config.
+        with _SAVE_LOCK:
+            self._write_config()
+
+    def _write_config(self):
         try:
             # Atomic write (tmp + rename): a crash/kill mid-save can never
             # leave a half-written config.json that blocks the next launch.
@@ -1012,8 +1078,9 @@ class MenuBarApp(rumps.App):
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2)
             os.replace(tmp, self.config_path)
-        except OSError:
-            pass  # non-fatal: choice still applies for this session
+        except (OSError, RuntimeError) as exc:  # RuntimeError: dict changed mid-dump
+            # Non-fatal: the choice still applies for this session.
+            print(f"[config] save failed: {exc!r}", flush=True)
 
     # ---------------------------------------------------------- permissions
 
@@ -1026,8 +1093,11 @@ class MenuBarApp(rumps.App):
             rumps.alert(
                 "WhisperFlow — permission needed",
                 "Open System Settings → Privacy & Security → Accessibility and "
-                "turn ON the Python entry (shown as 'python3.x'), then quit and "
-                "reopen WhisperFlow.",
+                "turn ON the Python entries (shown as 'Python' and 'python3.x'); "
+                "do the same under Input Monitoring. Then quit and reopen "
+                "WhisperFlow.\n\nAfter a Homebrew Python upgrade the old "
+                "entries stop working even though they look switched on: remove "
+                "them with − and add them again.",
             )
 
     # ---------------------------------------------------------------- state

@@ -57,6 +57,12 @@ Grant these to **the app you launch Python from** (Terminal, iTerm2, etc.) in
 
 After granting Input Monitoring or Accessibility, restart the terminal app.
 
+After a Homebrew Python upgrade these grants silently stop applying (they
+belong to the old Python file) — see **Troubleshooting** in
+[INSTALL.md](INSTALL.md). WhisperFlow detects it and says so in a bubble, and
+it also warns when a take is pure silence (wrong input device or no mic
+permission) instead of transcribing Whisper's hallucinations.
+
 ## Run
 
 ```bash
@@ -138,7 +144,12 @@ Set `injection.delivery_method` in `config.json`:
     "restore_clipboard": true,
     "type_char_delay_ms": 5
   },
-  "audio": { "sample_rate": 16000, "channels": 1, "mic_gain": 4.5 },
+  "audio": {
+    "sample_rate": 16000, "channels": 1, "mic_gain": 4.5,
+    "input_device": "builtin"  // "builtin" = the Mac's mic even with an interface
+                               // connected; "default" = follow macOS; or a device
+                               // name. Switch live: right-click Marvin → Microphone
+  },
   "vocabulary": {
     "terms": ["Ollama", "WhisperFlow"],  // bias Whisper toward these spellings
     "fixes": { "olama": "Ollama" }        // force exact corrections (wrong->right)

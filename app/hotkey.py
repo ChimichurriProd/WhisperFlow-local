@@ -16,9 +16,12 @@ import sys
 import threading
 import time
 
-from .audio import Recorder
+import numpy as np
+
+from .audio import BUILTIN, Recorder, is_builtin, lid_closed
 from .cleanup import clean_transcript, collapse_repeats
 from .injection import inject_text
+from .permissions import is_trusted
 from .sound import play_done, play_start
 from .stt import Transcriber, build_initial_prompt
 
@@ -30,6 +33,26 @@ _ASK_UNREACHABLE = (
     "Something went wrong reaching my brain. Is Ollama running, with the "
     "model pulled? Predictably grim.")
 _ASK_EMPTY = "I have nothing to say. For once, that's honest rather than rude."
+
+# A take whose loudest sample stays under SILENT_PEAK is digital silence, not a
+# quiet room: measured peak ~0.00003 from a Scarlett with no mic plugged in,
+# ~0.05 from a MacBook's built-in mic in an ordinary room.
+SILENT_PEAK = 0.0003
+SILENT_MIN_SECONDS = 0.5
+SILENT_NOTICE = (
+    "Jag hör ingenting från {device}. Högerklicka på mig → Microphone och "
+    "välj en annan, eller kolla System Settings → Privacy & Security → "
+    "Microphone.")
+LID_NOTICE = (
+    "Locket är stängt, så den inbyggda mikrofonen är avstängd. Jag bytte "
+    "till {device}. Säg det igen.")
+# Shared with the startup check in menubar.py.
+TRUST_NOTICE = (
+    "Jag saknar behörighet för tangentbordet, så snabbkommandot fungerar "
+    "inte. Slå på Python och python3.x under System Settings → Privacy & "
+    "Security → Accessibility och Input Monitoring. Ser de redan påslagna ut "
+    "efter en Python-uppdatering: ta bort dem med minus, starta om mig och "
+    "slå på de nya.")
 
 
 def parse_hotkey(spec):
@@ -133,8 +156,13 @@ def resolve_trigger_vk(required):
 
 
 class PushToTalkApp:
-    def __init__(self, config, on_status=None, on_answer=None, on_ask_start=None):
+    def __init__(self, config, on_status=None, on_answer=None, on_ask_start=None,
+                 on_notice=None):
         self.config = config
+        # on_notice(text) — a short status message for the user (speech bubble
+        # by Marvin). Called from worker threads; None -> just the log line.
+        self._on_notice = on_notice
+        self._trust_lost = False
         # on_answer(question, answer) — the UI presents Marvin's reply (speech
         # bubble + optional TTS). None -> just print it.
         self._on_answer = on_answer
@@ -146,6 +174,7 @@ class PushToTalkApp:
             sample_rate=config["audio"]["sample_rate"],
             channels=config["audio"]["channels"],
             mic_gain=config["audio"].get("mic_gain", 4.5),
+            device=config["audio"].get("input_device", BUILTIN),
         )
         self._initial_prompt = build_initial_prompt(
             config.get("vocabulary", {}).get("terms", [])
@@ -540,8 +569,27 @@ class PushToTalkApp:
         self.config.setdefault("ask", {})["enabled"] = self._ask_on
 
     def _status(self, state):
+        # While Accessibility is gone the hotkeys are dead: keep showing that
+        # rather than letting a finishing job report "idle".
+        if getattr(self, "_trust_lost", False) and state != "blocked":
+            return
         if self._on_status is not None:
             self._on_status(state)
+
+    def _notice(self, text):
+        if self._on_notice is not None:
+            self._on_notice(text)
+
+    def set_input_device(self, spec):
+        """Switch microphone live (Microphone menu). Refused while a take is
+        being recorded — closing the stream would cut it off. Returns True if
+        switched."""
+        with self._mic_lock:
+            if self._active:
+                return False
+            self.config["audio"]["input_device"] = spec
+            self.recorder.set_device(spec)
+        return True
 
     def _start_recording(self, kind="dictate", hands_free=False):
         # Any recording starting shuts him up: recording over his own playback
@@ -625,8 +673,25 @@ class PushToTalkApp:
 
                 tap = self._event_tap
                 if tap is not None and not Quartz.CGEventTapIsEnabled(tap):
-                    Quartz.CGEventTapEnable(tap, True)
-                    print("[hotkey] event tap was disabled — re-enabled", flush=True)
+                    if not is_trusted():
+                        # macOS revoked Accessibility (typically: Homebrew
+                        # upgraded Python, so the binary the grant belonged
+                        # to is gone). Re-enabling cannot work; say so once
+                        # instead of logging a re-enable every 150 ms.
+                        if not self._trust_lost:
+                            self._trust_lost = True
+                            print("[hotkey] Accessibility permission lost — "
+                                  "hotkeys are off until it is granted again",
+                                  flush=True)
+                            self._status("blocked")
+                            self._notice(TRUST_NOTICE)
+                    else:
+                        if self._trust_lost:
+                            self._trust_lost = False
+                            self._status("paused" if self._paused else "idle")
+                        Quartz.CGEventTapEnable(tap, True)
+                        print("[hotkey] event tap was disabled — re-enabled",
+                              flush=True)
 
                 if self._active and not self._toggle:
                     # Hold mode: a physically-released key/modifier means the
@@ -734,6 +799,25 @@ class PushToTalkApp:
             print("[rec] no audio captured", flush=True)
             return
         seconds = len(audio) / self.config["audio"]["sample_rate"]
+        peak = float(np.abs(audio).max())
+        if seconds >= SILENT_MIN_SECONDS and peak < SILENT_PEAK:
+            # Digital silence: no real mic is that quiet, even in a still
+            # room. It means an audio interface with nothing plugged in, or
+            # missing Microphone permission (macOS then delivers zeros).
+            # Whisper would only invent words ("thriller thriller…").
+            name = self.recorder.device_name or "mikrofonen"
+            print(f"[rec] captured {seconds:.1f}s of silence (peak {peak:.6f}) "
+                  f"from {name!r} — skipped", flush=True)
+            if (self.recorder.device == BUILTIN and is_builtin(name)
+                    and lid_closed()):
+                # The lid was shut after the stream opened: the built-in mic
+                # is cut off in hardware. Reopen on the system default.
+                if self.set_input_device(BUILTIN):
+                    self._notice(LID_NOTICE.format(
+                        device=self.recorder.device_name or "systemets mikrofon"))
+                    return
+            self._notice(SILENT_NOTICE.format(device=name))
+            return
         print(f"[rec] captured {seconds:.1f}s, transcribing...", flush=True)
         raw = self.transcriber.transcribe(audio)
         if not raw:

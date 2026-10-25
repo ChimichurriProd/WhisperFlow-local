@@ -1800,3 +1800,194 @@ def test_release_signals_thinking_immediately():
         eng._start_recording("dictate")
         eng._stop_recording("test")
     assert states[-1] == "transcribing", states
+
+
+# -------------------------------------------------------- microphone choice
+
+_DEVICES = [(2, "Scarlett 2i2 USB"), (3, "MacBook Pro Microphone")]
+
+
+def test_builtin_mic_wins_over_audio_interface():
+    from app.audio import resolve_input_device
+
+    assert resolve_input_device("builtin", _DEVICES) == 3
+
+
+def test_builtin_matches_other_mac_models():
+    from app.audio import resolve_input_device
+
+    for name in ("MacBook Air Microphone", "iMac Microphone",
+                 "Built-in Microphone"):
+        assert resolve_input_device("builtin", [(0, "USB Mic"), (1, name)]) == 1
+
+
+def test_mic_falls_back_to_system_default():
+    from app.audio import resolve_input_device
+
+    # No built-in mic (Mac mini), unknown name, or explicit "default".
+    assert resolve_input_device("builtin", [(2, "Scarlett 2i2 USB")]) is None
+    assert resolve_input_device("Unplugged Mic", _DEVICES) is None
+    assert resolve_input_device("default", _DEVICES) is None
+    assert resolve_input_device(None, _DEVICES) is None
+
+
+def test_mic_by_exact_name():
+    from app.audio import resolve_input_device
+
+    assert resolve_input_device("Scarlett 2i2 USB", _DEVICES) == 2
+
+
+def test_config_defaults_to_builtin_mic(config):
+    assert config["audio"]["input_device"] == "builtin"
+
+
+def test_silent_take_is_skipped_with_notice(config):
+    """An interface with nothing plugged in delivers ~0.00003 peaks: Marvin
+    must say so instead of transcribing (Whisper hallucinates on silence)."""
+    import numpy as np
+
+    from app.hotkey import PushToTalkApp
+
+    app = PushToTalkApp.__new__(PushToTalkApp)
+    app.config = config
+    app._active = False
+    app._on_status = None
+    notices = []
+    app._on_notice = notices.append
+    app.recorder = type("R", (), {"device_name": "Scarlett 2i2 USB",
+                                  "device": "Scarlett 2i2 USB"})()
+    app.transcriber = type("T", (), {"transcribe": lambda self, a: pytest.fail(
+        "silence must not reach Whisper")})()
+
+    silence = np.full(16000, 0.00003, dtype=np.float32)
+    app._process("dictate", silence)
+    assert len(notices) == 1 and "Scarlett 2i2 USB" in notices[0]
+
+
+def test_mic_open_retries_after_rescan(monkeypatch):
+    """A mic unplugged since launch is still in PortAudio's stale list and
+    fails to open: the recorder rescans and retries instead of giving up."""
+    import sys
+    import types
+
+    from app import audio
+
+    calls = {"open": 0, "rescan": 0}
+
+    class FakeStream:
+        def __init__(self, **kw):
+            calls["open"] += 1
+            if calls["open"] == 1:
+                raise RuntimeError("Invalid device")
+            self.device, self.samplerate = kw["device"], 16000
+            self.channels, self.blocksize, self.active = 1, 0, True
+
+        def start(self):
+            pass
+
+        def read(self, n):
+            import numpy as np
+            return np.zeros((n, 1), dtype="float32"), False
+
+        def stop(self):
+            pass
+
+        def close(self):
+            self.active = False
+
+    fake_sd = types.SimpleNamespace(
+        InputStream=FakeStream,
+        query_devices=lambda i=None: (
+            {"name": "MacBook Pro Microphone"} if i is not None else
+            [{"name": "MacBook Pro Microphone", "max_input_channels": 1}]),
+    )
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+    monkeypatch.setattr(audio, "rescan_devices",
+                        lambda: calls.__setitem__("rescan", calls["rescan"] + 1))
+
+    rec = audio.Recorder()
+    rec._ensure_stream()
+    assert calls == {"open": 2, "rescan": 1}
+    assert rec.device_name == "MacBook Pro Microphone"
+    rec.close()
+
+
+def test_mic_switch_refused_mid_take(config):
+    import threading
+
+    from app.hotkey import PushToTalkApp
+
+    app = PushToTalkApp.__new__(PushToTalkApp)
+    app.config = config
+    app._mic_lock = threading.Lock()
+    app._active = True
+    app.recorder = type("R", (), {"set_device": lambda self, s: pytest.fail(
+        "must not touch the stream mid-take")})()
+    assert app.set_input_device("default") is False
+    assert config["audio"]["input_device"] == "builtin"
+
+
+def test_builtin_skipped_when_lid_closed():
+    from app.audio import resolve_input_device
+
+    assert resolve_input_device("builtin", _DEVICES, lid_is_closed=True) is None
+    # An explicit device choice is not affected by the lid.
+    assert resolve_input_device("Scarlett 2i2 USB", _DEVICES, True) == 2
+
+
+def test_quiet_real_take_still_transcribed(config):
+    """A real mic in a quiet room (peak ~0.001) must not trip the guard."""
+    import numpy as np
+
+    from app.hotkey import PushToTalkApp
+
+    app = PushToTalkApp.__new__(PushToTalkApp)
+    app.config = config
+    app._active = False
+    app._on_status = None
+    app._on_notice = lambda t: pytest.fail(f"unexpected notice: {t}")
+    heard = []
+    app.transcriber = type("T", (), {
+        "transcribe": lambda self, a: heard.append(a) or ""})()
+    app._process("dictate", np.full(16000, 0.001, dtype=np.float32))
+    assert len(heard) == 1
+
+
+def test_blocked_status_sticks_while_trust_lost():
+    from app.hotkey import PushToTalkApp
+
+    app = PushToTalkApp.__new__(PushToTalkApp)
+    seen = []
+    app._on_status = seen.append
+    app._trust_lost = True
+    app._status("idle")
+    app._status("blocked")
+    assert seen == ["blocked"]
+
+
+def test_silent_builtin_with_lid_closed_switches_mic(config, monkeypatch):
+    """Lid shut after the stream opened: the built-in mic goes dead. Marvin
+    reopens on the system default and asks the user to say it again."""
+    import numpy as np
+
+    from app import hotkey
+    from app.hotkey import PushToTalkApp
+
+    monkeypatch.setattr(hotkey, "lid_closed", lambda: True)
+    app = PushToTalkApp.__new__(PushToTalkApp)
+    app.config = config
+    app._active = False
+    app._on_status = None
+    notices = []
+    app._on_notice = notices.append
+    rec = type("R", (), {"device_name": "MacBook Pro Microphone",
+                         "device": "builtin"})()
+    app.recorder = rec
+
+    def switch(spec):
+        rec.device_name = "USB Mic"
+        return True
+
+    app.set_input_device = switch
+    app._process("dictate", np.zeros(16000, dtype=np.float32))
+    assert len(notices) == 1 and "USB Mic" in notices[0]

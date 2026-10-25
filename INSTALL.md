@@ -32,9 +32,9 @@ and it identifies this app as **"python3.x"** (because it runs on Python), not
 "WhisperFlow". After the installer finishes:
 
 1. **System Settings → Privacy & Security → Accessibility** → turn **ON** the
-   `python3.x` entry.
+   `python3.x` entry (and **Python**, if it is listed too).
 2. **System Settings → Privacy & Security → Input Monitoring** → turn **ON** the
-   same `python3.x` entry.
+   same entries.
 3. Right-click Marvin → **Quit**, then reopen **WhisperFlow** from your
    **Applications** folder.
 
@@ -46,10 +46,38 @@ and it identifies this app as **"python3.x"** (because it runs on Python), not
 - Allow the **Microphone** prompt the first time, then dictate again.
 - Speak Swedish or English — it detects the language automatically.
 - **Right-click Marvin** for settings: **Model** (accuracy), **Language**,
-  **AI cleanup** on/off (verbatim), **Sound cues**, **Appearance**.
+  **Microphone**, **AI cleanup** on/off (verbatim), **Sound cues**, **Appearance**.
+- Marvin records from the **Mac's own microphone** by default, even when an
+  audio interface is connected. To use an external mic: right-click Marvin →
+  **Microphone** and pick it (or **System default** to follow macOS).
 - **Drag** Marvin anywhere; he remembers where you put him.
 
 It **starts automatically at every login** — no terminal needed.
+
+## Troubleshooting
+
+**The hotkey stopped working (it used to work).** Usually Homebrew upgraded
+Python: macOS ties the permission to the exact Python file, so the old entries
+still look switched on but no longer count. Marvin tells you in a bubble.
+1. In **Accessibility** and **Input Monitoring**, select every `python3.x` /
+   `Python` entry and remove it with **−**.
+2. Quit and reopen WhisperFlow. macOS asks again → **Open System Settings** and
+   switch the new entries on (add them with **+** if they don't appear).
+3. Quit and reopen once more — a permission only applies to a fresh start.
+
+The Microphone list has no +/− buttons. If dictation records but nothing is
+heard after such an upgrade, reset it and allow the prompt on the next take:
+```bash
+tccutil reset Microphone org.python.python
+```
+
+To stop it happening at every upgrade: `brew pin python@3.14` (use your
+version; `brew unpin` to upgrade later).
+
+**Marvin animates but no text appears.** He is hearing silence and says so in
+a bubble. Typical cause: an audio interface (Scarlett etc.) with nothing
+plugged in has become the input. Right-click Marvin → **Microphone** → pick
+**MacBook microphone**, or plug in a mic and pick the interface.
 
 ## Uninstall
 

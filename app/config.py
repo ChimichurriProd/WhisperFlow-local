@@ -111,6 +111,11 @@ DEFAULTS = {
         "sample_rate": 16000,
         "channels": 1,
         "mic_gain": 4.5,  # waveform sensitivity; higher = more reactive
+        # Which mic to record from (Microphone menu on Marvin): "builtin" =
+        # the Mac's own mic even when an audio interface is connected (macOS
+        # makes every new interface the default input, and an empty one is
+        # silent); "default" = follow macOS; or an exact device name.
+        "input_device": "builtin",
     },
     "vocabulary": {
         # 'terms' bias Whisper toward these spellings (names, jargon, brands).
